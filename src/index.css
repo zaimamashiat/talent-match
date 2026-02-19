@@ -2,95 +2,70 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Definition of the design system. All colors, gradients, fonts, etc should be defined here. 
-All colors MUST be HSL.
-*/
-
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    /* Navy dark base */
+    --background: 220 30% 97%;
+    --foreground: 222 47% 11%;
 
     --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card-foreground: 222 47% 11%;
 
     --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
+    --popover-foreground: 222 47% 11%;
 
-    --primary: 222.2 47.4% 11.2%;
+    /* Deep navy primary */
+    --primary: 224 64% 20%;
     --primary-foreground: 210 40% 98%;
 
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
+    --secondary: 213 27% 93%;
+    --secondary-foreground: 224 64% 20%;
 
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
+    --muted: 213 27% 94%;
+    --muted-foreground: 215 16% 47%;
 
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
+    /* Teal accent */
+    --accent: 174 72% 40%;
+    --accent-foreground: 0 0% 100%;
 
-    --destructive: 0 84.2% 60.2%;
+    --destructive: 0 84% 60%;
     --destructive-foreground: 210 40% 98%;
 
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
+    --border: 214 32% 88%;
+    --input: 214 32% 88%;
+    --ring: 174 72% 40%;
 
-    --radius: 0.5rem;
+    --radius: 0.625rem;
 
-    --sidebar-background: 0 0% 98%;
+    /* Sidebar */
+    --sidebar-background: 224 64% 14%;
+    --sidebar-foreground: 213 30% 85%;
+    --sidebar-primary: 174 72% 50%;
+    --sidebar-primary-foreground: 224 64% 10%;
+    --sidebar-accent: 224 40% 22%;
+    --sidebar-accent-foreground: 213 30% 90%;
+    --sidebar-border: 224 40% 20%;
+    --sidebar-ring: 174 72% 50%;
 
-    --sidebar-foreground: 240 5.3% 26.1%;
+    /* Custom tokens */
+    --navy-900: 224 64% 10%;
+    --navy-800: 224 64% 14%;
+    --navy-700: 224 52% 20%;
+    --teal-500: 174 72% 40%;
+    --teal-400: 174 72% 50%;
+    --teal-glow: 174 72% 60%;
 
-    --sidebar-primary: 240 5.9% 10%;
+    --score-high: 142 76% 36%;
+    --score-mid: 38 92% 50%;
+    --score-low: 0 84% 60%;
 
-    --sidebar-primary-foreground: 0 0% 98%;
+    --gradient-brand: linear-gradient(135deg, hsl(224 64% 14%), hsl(224 52% 24%));
+    --gradient-teal: linear-gradient(135deg, hsl(174 72% 35%), hsl(174 72% 50%));
+    --gradient-card: linear-gradient(145deg, hsl(0 0% 100%), hsl(213 27% 97%));
 
-    --sidebar-accent: 240 4.8% 95.9%;
-
-    --sidebar-accent-foreground: 240 5.9% 10%;
-
-    --sidebar-border: 220 13% 91%;
-
-    --sidebar-ring: 217.2 91.2% 59.8%;
-  }
-
-  .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-
-    --primary: 210 40% 98%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 212.7 26.8% 83.9%;
-    --sidebar-background: 240 5.9% 10%;
-    --sidebar-foreground: 240 4.8% 95.9%;
-    --sidebar-primary: 224.3 76.3% 48%;
-    --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 240 3.7% 15.9%;
-    --sidebar-accent-foreground: 240 4.8% 95.9%;
-    --sidebar-border: 240 3.7% 15.9%;
-    --sidebar-ring: 217.2 91.2% 59.8%;
+    --shadow-card: 0 4px 24px -4px hsl(224 64% 14% / 0.12), 0 1px 4px hsl(224 64% 14% / 0.06);
+    --shadow-elevated: 0 8px 40px -8px hsl(224 64% 14% / 0.2), 0 2px 8px hsl(224 64% 14% / 0.08);
+    --shadow-teal: 0 4px 20px -4px hsl(174 72% 40% / 0.3);
   }
 }
 
@@ -98,8 +73,44 @@ All colors MUST be HSL.
   * {
     @apply border-border;
   }
-
   body {
     @apply bg-background text-foreground;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   }
+}
+
+@layer utilities {
+  .sidebar-bg {
+    background: var(--gradient-brand);
+  }
+  .teal-gradient {
+    background: var(--gradient-teal);
+  }
+  .card-gradient {
+    background: var(--gradient-card);
+  }
+  .shadow-card {
+    box-shadow: var(--shadow-card);
+  }
+  .shadow-elevated {
+    box-shadow: var(--shadow-elevated);
+  }
+  .shadow-teal {
+    box-shadow: var(--shadow-teal);
+  }
+  .text-teal {
+    color: hsl(var(--teal-500));
+  }
+  .bg-teal {
+    background: hsl(var(--teal-500));
+  }
+  .bg-navy {
+    background: hsl(var(--navy-800));
+  }
+  .score-high { color: hsl(var(--score-high)); }
+  .score-mid  { color: hsl(var(--score-mid)); }
+  .score-low  { color: hsl(var(--score-low)); }
+  .bg-score-high { background: hsl(var(--score-high) / 0.1); border-color: hsl(var(--score-high) / 0.3); }
+  .bg-score-mid  { background: hsl(var(--score-mid) / 0.1);  border-color: hsl(var(--score-mid) / 0.3); }
+  .bg-score-low  { background: hsl(var(--score-low) / 0.1);  border-color: hsl(var(--score-low) / 0.3); }
 }
