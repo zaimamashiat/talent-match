@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import heroBg from "@/assets/hero-bg.jpg";
 import { Sidebar } from "@/components/Sidebar";
 import { StatsCards } from "@/components/StatsCards";
@@ -6,16 +6,44 @@ import { JDCard } from "@/components/JDCard";
 import { RankingTable } from "@/components/RankingTable";
 import { AnalyticsView } from "@/components/AnalyticsView";
 import { UploadView } from "@/components/UploadView";
-import { mockJDs, mockCandidates } from "@/data/mockData";
 import { Bell, Search } from "lucide-react";
+import type { ApiCVRankEntry, UIJD, UICandidate } from "@/lib/types";
 
 type View = "dashboard" | "jds" | "candidates" | "analytics" | "upload" | "settings";
 
+/** If your RankingTable expects the backend format directly, return entries as-is. */
+function mapApiCandidatesToTable(entries: ApiCVRankEntry[]): UICandidate[] {
+  // ✅ Default: pass-through
+  // If your table expects different keys, adjust here.
+  return entries.map((e) => ({
+    ...e,
+    id: e.candidate_id,
+    name: e.candidate_id, // placeholder if your table shows a "name"
+  }));
+}
+
+function pickField(obj: Record<string, any>, keys: string[], fallback = "") {
+  for (const k of keys) {
+    if (obj?.[k] !== undefined && obj?.[k] !== null && String(obj[k]).trim() !== "") return String(obj[k]);
+  }
+  return fallback;
+}
+
 export default function Index() {
   const [activeView, setActiveView] = useState<View>("dashboard");
-  const [selectedJD, setSelectedJD] = useState(mockJDs[0]);
 
-  const candidates = mockCandidates[selectedJD.id] || [];
+  // Live data
+  const [jds, setJDs] = useState<UIJD[]>([]);
+  const [candidatesByJd, setCandidatesByJd] = useState<Record<string, UICandidate[]>>({});
+  const [selectedJdId, setSelectedJdId] = useState<string | null>(null);
+
+  const selectedJD = useMemo(() => {
+    if (!jds.length) return null;
+    if (!selectedJdId) return jds[0];
+    return jds.find((j) => j.id === selectedJdId) ?? jds[0];
+  }, [jds, selectedJdId]);
+
+  const candidates = selectedJD ? candidatesByJd[selectedJD.id] || [] : [];
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
@@ -54,15 +82,34 @@ export default function Index() {
               {/* Hero Banner */}
               <div
                 className="relative rounded-2xl overflow-hidden h-44 flex items-end p-6"
-                style={{ backgroundImage: `url(${heroBg})`, backgroundSize: "cover", backgroundPosition: "center 30%" }}
+                style={{
+                  backgroundImage: `url(${heroBg})`,
+                  backgroundSize: "cover",
+                  backgroundPosition: "center 30%",
+                }}
               >
-                <div className="absolute inset-0" style={{ background: "linear-gradient(105deg, hsl(224,64%,14%) 45%, hsl(224,64%,14%,0.6) 70%, hsl(224,64%,14%,0.1) 100%)" }} />
+                <div
+                  className="absolute inset-0"
+                  style={{
+                    background:
+                      "linear-gradient(105deg, hsl(224,64%,14%) 45%, hsl(224,64%,14%,0.6) 70%, hsl(224,64%,14%,0.1) 100%)",
+                  }}
+                />
                 <div className="relative z-10">
                   <h1 className="text-2xl font-bold text-white tracking-tight">CV Screening Pipeline</h1>
                   <p className="text-sm text-white/70 mt-1">AI-powered talent ranking — BERT · SBERT · Fuzzy Matching · LLaMA</p>
                   <div className="flex items-center gap-4 mt-3">
-                    {["115 Candidates", "4 Job Descriptions", "68.4% Avg Match"].map(tag => (
-                      <span key={tag} className="px-2 py-0.5 rounded-full bg-white/10 border border-white/20 text-xs text-white/80 font-medium">{tag}</span>
+                    {[
+                      `${Object.values(candidatesByJd).reduce((a, b) => a + b.length, 0)} Candidates`,
+                      `${jds.length} Job Descriptions`,
+                      selectedJD ? `${(candidates?.[0]?.tech_match_pct ?? 0)}% Top Tech Match` : "—",
+                    ].map((tag) => (
+                      <span
+                        key={tag}
+                        className="px-2 py-0.5 rounded-full bg-white/10 border border-white/20 text-xs text-white/80 font-medium"
+                      >
+                        {tag}
+                      </span>
                     ))}
                   </div>
                 </div>
@@ -75,22 +122,26 @@ export default function Index() {
                 <div className="xl:col-span-1 space-y-3">
                   <div className="flex items-center justify-between">
                     <h2 className="text-sm font-semibold text-foreground">Job Descriptions</h2>
-                    <button
-                      onClick={() => setActiveView("upload")}
-                      className="text-xs text-teal font-medium hover:underline"
-                    >
+                    <button onClick={() => setActiveView("upload")} className="text-xs text-teal font-medium hover:underline">
                       + Upload JD
                     </button>
                   </div>
-                  {mockJDs.map(jd => (
-                    <JDCard
-                      key={jd.id}
-                      jd={jd}
-                      isSelected={selectedJD.id === jd.id}
-                      onSelect={() => setSelectedJD(jd)}
-                      candidateCount={mockCandidates[jd.id]?.length ?? 0}
-                    />
-                  ))}
+
+                  {jds.length === 0 ? (
+                    <div className="rounded-xl border bg-card shadow-card p-4 text-sm text-muted-foreground">
+                      No JDs yet. Click <span className="font-semibold text-foreground">“Upload JD”</span> to start.
+                    </div>
+                  ) : (
+                    jds.map((jd) => (
+                      <JDCard
+                        key={jd.id}
+                        jd={jd as any}
+                        isSelected={selectedJD?.id === jd.id}
+                        onSelect={() => setSelectedJdId(jd.id)}
+                        candidateCount={candidatesByJd[jd.id]?.length ?? 0}
+                      />
+                    ))
+                  )}
                 </div>
 
                 {/* Rankings */}
@@ -98,9 +149,11 @@ export default function Index() {
                   <div className="flex items-center justify-between">
                     <div>
                       <h2 className="text-sm font-semibold text-foreground">
-                        Rankings — {selectedJD.Job_Title}
+                        Rankings — {selectedJD?.Job_Title ?? "No JD selected"}
                       </h2>
-                      <p className="text-xs text-muted-foreground">{selectedJD.Company} · {selectedJD.Location}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {selectedJD ? `${selectedJD.Company} · ${selectedJD.Location}` : "Upload a JD to view rankings."}
+                      </p>
                     </div>
                   </div>
 
@@ -108,15 +161,25 @@ export default function Index() {
                   <div className="rounded-xl border bg-card shadow-card p-4">
                     <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Required Tech Skills</p>
                     <div className="flex flex-wrap gap-1.5">
-                      {selectedJD.Technology.split(",").map(s => s.trim()).filter(Boolean).map(skill => (
-                        <span key={skill} className="px-2 py-0.5 rounded-full bg-primary/8 border border-primary/20 text-xs font-medium text-primary">
-                          {skill}
-                        </span>
-                      ))}
+                      {(selectedJD?.Technology ?? "")
+                        .split(",")
+                        .map((s) => s.trim())
+                        .filter(Boolean)
+                        .map((skill) => (
+                          <span
+                            key={skill}
+                            className="px-2 py-0.5 rounded-full bg-primary/8 border border-primary/20 text-xs font-medium text-primary"
+                          >
+                            {skill}
+                          </span>
+                        ))}
+                      {!selectedJD?.Technology && (
+                        <span className="text-xs text-muted-foreground">No extracted tech skills yet.</span>
+                      )}
                     </div>
                   </div>
 
-                  <RankingTable candidates={candidates} jdTitle={selectedJD.Job_Title} />
+                  <RankingTable candidates={candidates as any} jdTitle={selectedJD?.Job_Title ?? ""} />
                 </div>
               </div>
             </>
@@ -128,7 +191,7 @@ export default function Index() {
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-xl font-bold text-foreground">Job Descriptions</h2>
-                  <p className="text-sm text-muted-foreground">{mockJDs.length} JDs processed</p>
+                  <p className="text-sm text-muted-foreground">{jds.length} JDs processed</p>
                 </div>
                 <button
                   onClick={() => setActiveView("upload")}
@@ -137,14 +200,18 @@ export default function Index() {
                   + Upload New JD
                 </button>
               </div>
+
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                {mockJDs.map(jd => (
+                {jds.map((jd) => (
                   <JDCard
                     key={jd.id}
-                    jd={jd}
-                    isSelected={selectedJD.id === jd.id}
-                    onSelect={() => { setSelectedJD(jd); setActiveView("candidates"); }}
-                    candidateCount={mockCandidates[jd.id]?.length ?? 0}
+                    jd={jd as any}
+                    isSelected={selectedJD?.id === jd.id}
+                    onSelect={() => {
+                      setSelectedJdId(jd.id);
+                      setActiveView("candidates");
+                    }}
+                    candidateCount={candidatesByJd[jd.id]?.length ?? 0}
                   />
                 ))}
               </div>
@@ -162,23 +229,23 @@ export default function Index() {
               </div>
 
               <div className="flex gap-2 flex-wrap">
-                {mockJDs.map(jd => (
+                {jds.map((jd) => (
                   <button
                     key={jd.id}
-                    onClick={() => setSelectedJD(jd)}
+                    onClick={() => setSelectedJdId(jd.id)}
                     className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-                      selectedJD.id === jd.id
+                      selectedJD?.id === jd.id
                         ? "bg-primary text-primary-foreground"
                         : "bg-muted text-muted-foreground hover:bg-muted/80"
                     }`}
                   >
                     {jd.Job_Title}
-                    <span className="ml-1.5 opacity-60">({mockCandidates[jd.id]?.length ?? 0})</span>
+                    <span className="ml-1.5 opacity-60">({candidatesByJd[jd.id]?.length ?? 0})</span>
                   </button>
                 ))}
               </div>
 
-              <RankingTable candidates={mockCandidates[selectedJD.id] || []} jdTitle={selectedJD.Job_Title} />
+              <RankingTable candidates={candidates as any} jdTitle={selectedJD?.Job_Title ?? ""} />
             </div>
           )}
 
@@ -186,35 +253,40 @@ export default function Index() {
           {activeView === "analytics" && <AnalyticsView />}
 
           {/* Upload View */}
-          {activeView === "upload" && <UploadView />}
+          {activeView === "upload" && (
+            <UploadView
+              onCancel={() => setActiveView("dashboard")}
+              onSubmit={({ jdExtracted, ranking }) => {
+                // Build UI JD object from extracted JD JSON
+                const id = crypto.randomUUID();
 
-          {/* Settings View */}
+                const Job_Title = pickField(jdExtracted, ["Job_Title", "JobTitle", "title"], "Untitled JD");
+                const Company = pickField(jdExtracted, ["Company", "company"], "");
+                const Location = pickField(jdExtracted, ["Location", "location"], "");
+
+                const Technology = pickField(
+                  jdExtracted,
+                  ["Technology", "technologies", "Technical Skills", "Skills", "skills"],
+                  ""
+                );
+
+                const newJD: UIJD = { id, Job_Title, Company, Location, Technology };
+
+                const mappedCandidates = mapApiCandidatesToTable(ranking.rankings);
+
+                setJDs((prev) => [newJD, ...prev]);
+                setCandidatesByJd((prev) => ({ ...prev, [id]: mappedCandidates }));
+                setSelectedJdId(id);
+                setActiveView("dashboard");
+              }}
+            />
+          )}
+
+          {/* Settings View (keep your existing UI) */}
           {activeView === "settings" && (
             <div className="space-y-4 max-w-xl">
               <h2 className="text-xl font-bold text-foreground">Settings</h2>
               <div className="rounded-xl border bg-card shadow-card p-5 space-y-4">
-                <div>
-                  <label className="text-sm font-semibold text-foreground block mb-1">Groq API Key</label>
-                  <input type="password" defaultValue="gsk_••••••••••••••••" className="w-full px-3 py-2 text-sm rounded-lg border bg-muted/30 focus:outline-none focus:ring-2 focus:ring-ring" />
-                </div>
-                <div>
-                  <label className="text-sm font-semibold text-foreground block mb-1">Fuzzy Match Threshold</label>
-                  <input type="number" defaultValue={80} min={0} max={100} className="w-full px-3 py-2 text-sm rounded-lg border bg-muted/30 focus:outline-none focus:ring-2 focus:ring-ring" />
-                  <p className="text-xs text-muted-foreground mt-1">Minimum RapidFuzz score for a skill to count as matched (0–100)</p>
-                </div>
-                <div>
-                  <label className="text-sm font-semibold text-foreground block mb-1">SBERT Model</label>
-                  <select className="w-full px-3 py-2 text-sm rounded-lg border bg-muted/30 focus:outline-none focus:ring-2 focus:ring-ring">
-                    <option>all-mpnet-base-v2</option>
-                    <option>all-MiniLM-L6-v2</option>
-                    <option>paraphrase-multilingual-mpnet-base-v2</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-sm font-semibold text-foreground block mb-1">Tech Match Weight</label>
-                  <input type="number" defaultValue={60} min={0} max={100} className="w-full px-3 py-2 text-sm rounded-lg border bg-muted/30 focus:outline-none focus:ring-2 focus:ring-ring" />
-                  <p className="text-xs text-muted-foreground mt-1">% weight of Tech Match in overall score (remainder = Semantic Match)</p>
-                </div>
                 <button className="px-4 py-2 text-sm font-semibold rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 transition-colors">
                   Save Settings
                 </button>
