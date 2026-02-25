@@ -293,7 +293,7 @@ def _load_local_models():
 
 def run_designation_model(resume_text: str):
     _load_local_models()
-    label_map = {0: "Business Analyst", 1: "Data Scientist", 2: "SQA", 3: "Web Developer"}
+    label_map = {i: cat for i, cat in enumerate(CATEGORIES)}
     if _designation_model is None:
         return "Unknown", 0.0
     inputs = _designation_tokenizer(
@@ -303,7 +303,11 @@ def run_designation_model(resume_text: str):
         logits = _designation_model(**inputs).logits
         pred   = torch.argmax(logits, dim=-1).item()
         score  = torch.softmax(logits, dim=-1)[0, pred].item()
-    return label_map.get(pred, "Unknown"), score
+    
+    # Normalize confidence to 0.3–1.0 range
+    normalized_score = 0.3 + (score * 0.7)
+    
+    return label_map.get(pred, "Unknown"), round(normalized_score, 4)
 
 def run_experience_model(resume_text: str):
     _load_local_models()
@@ -504,8 +508,10 @@ Content:
         return f"Summary unavailable: {e}"
 
 def llm_extract_skills(text: str, groq_client) -> List[str]:
-    prompt = f"""List all technical skills, languages, frameworks, and tools mentioned in this text.
-Return ONLY a comma-separated list. Example: Python, React, Docker, PostgreSQL
+    prompt = f"""Extract technical skills ONLY if they are explicitly mentioned word-for-word in the text below.
+Do NOT infer, guess, or add related skills that are not directly written.
+Return ONLY a comma-separated list. No extra text.
+Example output: Python, React, Docker, PostgreSQL
 
 Text:
 {text[:2000]}"""
@@ -513,10 +519,16 @@ Text:
         resp = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0, max_completion_tokens=150,
+            temperature=0,
+            max_completion_tokens=150,
         )
         raw = resp.choices[0].message.content.strip()
-        return [s.strip() for s in raw.split(",") if s.strip()]
+
+        if "," not in raw:
+            raw = re.sub(r"([a-z])([A-Z])", r"\1,\2", raw)
+            raw = re.sub(r"([A-Z]{2,})([A-Z][a-z])", r"\1,\2", raw)
+
+        return list(dict.fromkeys([s.strip() for s in raw.split(",") if s.strip()]))
     except Exception:
         return []
 
