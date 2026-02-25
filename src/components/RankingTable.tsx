@@ -3,7 +3,7 @@ import { ScoreBadge } from "./ScoreBadge";
 import { SkillTag } from "./SkillTag";
 import { CandidateModal } from "./CandidateModal";
 import { Badge } from "@/components/ui/badge";
-import { ChevronUp, ChevronDown, Eye } from "lucide-react";
+import { ChevronUp, ChevronDown, Eye, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // ── API response shape from /rank-cvs ────────────────────────────────────────
@@ -25,7 +25,6 @@ export interface ApiCandidate {
   portfolio_type:       string | null;
   portfolio_summary:    string | null;
   portfolio_skills:     string[] | null;
-  // convenience aliases set by mapApiCandidatesToTable in Index.tsx
   id?:    string;
   name?:  string;
   email?: string;
@@ -37,30 +36,59 @@ type SortKey = "rank" | "tech_match_pct" | "semantic_match_pct";
 interface RankingTableProps {
   candidates: ApiCandidate[];
   jdTitle:    string;
+  onDelete?:  (candidateId: string) => void; // optional external handler
 }
 
-export function RankingTable({ candidates, jdTitle }: RankingTableProps) {
-  const [sortKey, setSortKey] = useState<SortKey>("rank");
-  const [sortAsc, setSortAsc]   = useState(true);
-  const [selected, setSelected] = useState<ApiCandidate | null>(null);
-  const [filter, setFilter]     = useState("");
+export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProps) {
+  const [sortKey, setSortKey]     = useState<SortKey>("rank");
+  const [sortAsc, setSortAsc]     = useState(true);
+  const [selected, setSelected]   = useState<ApiCandidate | null>(null);
+  const [filter, setFilter]       = useState("");
+  const [localList, setLocalList] = useState<ApiCandidate[]>(candidates);
+  const [confirmId, setConfirmId] = useState<string | null>(null);
 
-  // Helper: resolve display name with fallback chain
-  const displayName = (c: ApiCandidate) =>
-    c.candidate_name?.trim() || c.candidate_email?.trim() || c.candidate_id;
-
-  // Initials for avatar
-  const initials = (c: ApiCandidate) => {
-    const name = displayName(c);
-    return name
-      .split(" ")
-      .map((n) => n[0])
-      .join("")
-      .slice(0, 2)
-      .toUpperCase();
+  /**
+   * Resolve display name with full fallback chain:
+   * candidate_name → name alias → raw_row Name fields → email local-part → candidate_id
+   */
+  const displayName = (c: ApiCandidate) => {
+    // 1. Explicit name field
+    if (c.candidate_name?.trim()) return c.candidate_name.trim();
+    // 2. Convenience alias set by mapApiCandidatesToTable
+    if (c.name?.trim() && c.name.trim() !== (c.candidate_email ?? "").trim()) return c.name.trim();
+    // 3. Try raw_row for common name columns
+    if (c.raw_row) {
+      const nameKeys = ["Name", "name", "Full Name", "full_name", "FullName", "candidate_name"];
+      for (const k of nameKeys) {
+        const v = c.raw_row[k]?.trim();
+        if (v) return v;
+      }
+    }
+    // 4. Email local-part (before @) as readable fallback
+    if (c.candidate_email?.trim()) {
+      const local = c.candidate_email.split("@")[0];
+      // Humanise: replace dots/underscores/dashes with spaces, title-case
+      return local
+        .replace(/[._-]/g, " ")
+        .replace(/\b\w/g, (ch) => ch.toUpperCase());
+    }
+    // 5. Last resort
+    return c.candidate_id;
   };
 
-  const sorted = [...candidates]
+  const initials = (c: ApiCandidate) => {
+    const name = displayName(c);
+    return name.split(" ").map((n) => n[0]).join("").slice(0, 2).toUpperCase();
+  };
+
+  const handleDelete = (candidateId: string) => {
+    setLocalList((prev) => prev.filter((c) => c.candidate_id !== candidateId));
+    setConfirmId(null);
+    if (selected?.candidate_id === candidateId) setSelected(null);
+    onDelete?.(candidateId);
+  };
+
+  const sorted = [...localList]
     .filter((c) => {
       const q = filter.toLowerCase();
       return (
@@ -82,12 +110,10 @@ export function RankingTable({ candidates, jdTitle }: RankingTableProps) {
 
   const SortIcon = ({ col }: { col: SortKey }) =>
     sortKey === col
-      ? sortAsc
-        ? <ChevronUp className="w-3 h-3" />
-        : <ChevronDown className="w-3 h-3" />
+      ? sortAsc ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />
       : <ChevronUp className="w-3 h-3 opacity-30" />;
 
-  if (candidates.length === 0) {
+  if (localList.length === 0) {
     return (
       <div className="rounded-xl border bg-card shadow-card p-8 text-center">
         <p className="text-sm font-medium text-foreground">No candidates yet</p>
@@ -126,12 +152,8 @@ export function RankingTable({ candidates, jdTitle }: RankingTableProps) {
                       Rank <SortIcon col="rank" />
                     </button>
                   </th>
-                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">
-                    Candidate
-                  </th>
-                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">
-                    Category
-                  </th>
+                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">Candidate</th>
+                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">Category</th>
                   <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">
                     <button className="flex items-center gap-1" onClick={() => toggleSort("tech_match_pct")}>
                       Tech Match <SortIcon col="tech_match_pct" />
@@ -142,10 +164,8 @@ export function RankingTable({ candidates, jdTitle }: RankingTableProps) {
                       Semantic <SortIcon col="semantic_match_pct" />
                     </button>
                   </th>
-                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">
-                    Matched Skills
-                  </th>
-                  <th className="px-4 py-3 w-16" />
+                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">Matched Skills</th>
+                  <th className="px-4 py-3 w-28" />
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">
@@ -158,7 +178,7 @@ export function RankingTable({ candidates, jdTitle }: RankingTableProps) {
                     )}
                     onClick={() => setSelected(c)}
                   >
-                    {/* Rank badge */}
+                    {/* Rank */}
                     <td className="px-4 py-3">
                       <div className={cn(
                         "w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold",
@@ -171,19 +191,15 @@ export function RankingTable({ candidates, jdTitle }: RankingTableProps) {
                       </div>
                     </td>
 
-                    {/* Candidate name + email */}
+                    {/* Candidate */}
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2.5">
                         <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-primary font-semibold text-xs shrink-0">
                           {initials(c)}
                         </div>
                         <div className="min-w-0">
-                          <p className="font-medium text-foreground truncate max-w-[160px]">
-                            {displayName(c)}
-                          </p>
-                          <p className="text-xs text-muted-foreground truncate max-w-[160px]">
-                            {c.candidate_email || c.candidate_id}
-                          </p>
+                          <p className="font-medium text-foreground truncate max-w-[160px]">{displayName(c)}</p>
+                          <p className="text-xs text-muted-foreground truncate max-w-[160px]">{c.candidate_email || c.candidate_id}</p>
                         </div>
                       </div>
                     </td>
@@ -196,16 +212,12 @@ export function RankingTable({ candidates, jdTitle }: RankingTableProps) {
                     </td>
 
                     {/* Tech match */}
-                    <td className="px-4 py-3">
-                      <ScoreBadge score={c.tech_match_pct} showBar />
-                    </td>
+                    <td className="px-4 py-3"><ScoreBadge score={c.tech_match_pct} showBar /></td>
 
                     {/* Semantic match */}
-                    <td className="px-4 py-3">
-                      <ScoreBadge score={c.semantic_match_pct} showBar />
-                    </td>
+                    <td className="px-4 py-3"><ScoreBadge score={c.semantic_match_pct} showBar /></td>
 
-                    {/* Matched skills preview */}
+                    {/* Matched skills */}
                     <td className="px-4 py-3">
                       <div className="flex flex-wrap gap-1 max-w-[200px]">
                         {(c.matched_skills ?? []).slice(0, 3).map((s) => (
@@ -222,14 +234,43 @@ export function RankingTable({ candidates, jdTitle }: RankingTableProps) {
                       </div>
                     </td>
 
-                    {/* View button */}
-                    <td className="px-4 py-3">
-                      <button
-                        className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1 text-xs text-teal font-medium"
-                        onClick={(e) => { e.stopPropagation(); setSelected(c); }}
-                      >
-                        <Eye className="w-3.5 h-3.5" /> View
-                      </button>
+                    {/* Actions: View + Delete */}
+                    <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-center gap-2">
+                        {/* View */}
+                        <button
+                          className="flex items-center gap-1 text-xs text-teal font-medium"
+                          onClick={(e) => { e.stopPropagation(); setSelected(c); }}
+                        >
+                          <Eye className="w-3.5 h-3.5" /> View
+                        </button>
+
+                        {/* Delete with inline confirmation */}
+                        {confirmId === c.candidate_id ? (
+                          <div className="flex items-center gap-1">
+                            <button
+                              className="text-[11px] text-destructive font-semibold hover:underline"
+                              onClick={(e) => { e.stopPropagation(); handleDelete(c.candidate_id); }}
+                            >
+                              Confirm
+                            </button>
+                            <span className="text-muted-foreground text-[11px]">/</span>
+                            <button
+                              className="text-[11px] text-muted-foreground hover:underline"
+                              onClick={(e) => { e.stopPropagation(); setConfirmId(null); }}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-destructive transition-colors font-medium"
+                            onClick={(e) => { e.stopPropagation(); setConfirmId(c.candidate_id); }}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" /> Delete
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}

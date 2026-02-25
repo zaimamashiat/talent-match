@@ -1,5 +1,5 @@
 """
-CV Screening Pipeline - FastAPI Version v2.0 (fixed CSV -> candidate fields)
+CV Screening Pipeline - FastAPI Version v2.1
 Run: uvicorn main:app --reload --port 8000 --host 0.0.0.0
 """
 
@@ -10,10 +10,40 @@ import json
 import tempfile
 from typing import List, Optional, Dict, Any
 
+# ──────────────────────────────────────────────
+# PATHS (no config.py needed)
+# ──────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+OCR_OUTPUT_FOLDER           = os.path.join(BASE_DIR, "ocr_output")
+EXCEL_OUTPUT_PATH           = os.path.join(BASE_DIR, "resume_summary.xlsx")
+LDA_MODEL_PATH              = os.path.join(BASE_DIR, "models", "lda_model")
+EMBED_DATA_PATH             = os.path.join(BASE_DIR, "models", "id2word.pkl")
+EMBED_TFIDF_PATH            = os.path.join(BASE_DIR, "models", "tfidf_model.pkl")
+PROCESSED_BIGRAM_DATA_PATH  = os.path.join(BASE_DIR, "models", "bigram_mod.pkl")
+PROCESSED_TRIGRAM_DATA_PATH = os.path.join(BASE_DIR, "models", "trigram_mod.pkl")
+K_MEANS_MODEL_PATH          = os.path.join(BASE_DIR, "models", "kmeans_model.pkl")
+DESIGNATION_MODEL_PATH      = os.path.join(BASE_DIR, "models", "designation_model")
+EXPERIENCE_MODEL_PATH       = os.path.join(BASE_DIR, "models", "experience_model")
+
+NER_MODEL_PATH = os.getenv(
+    "NER_MODEL_PATH",
+    r"C:\PROJECTS\models\ner"
+)
+
+# Create folders if they don't exist
+os.makedirs(OCR_OUTPUT_FOLDER, exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "models"), exist_ok=True)
+
+# ──────────────────────────────────────────────
+# IMPORTS
+# ──────────────────────────────────────────────
 import pdfplumber
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -24,33 +54,40 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from rapidfuzz import fuzz
 from groq import Groq
 import spacy
+import numpy as np
+import pickle
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import normalize
+from gensim import models as gensim_models
+from gensim.utils import simple_preprocess
+from gensim.matutils import sparse2full
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from nltk.probability import FreqDist
+from dateutil import parser as date_parser
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from collections import defaultdict
+import docx2txt
 
 # ──────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-MAX_CHARS_JD = 4000
-MAX_CHARS_CV = 2000
+MAX_CHARS_JD  = 4000
+MAX_CHARS_CV  = 2000
 MAX_CHARS_WEB = 3000
-GITHUB_API = "https://api.github.com"
+GITHUB_API    = "https://api.github.com"
 
-# ── Local spaCy NER model path ─────────────────────────────────────────────
-NER_MODEL_PATH = os.getenv(
-    "NER_MODEL_PATH",
-    r"C:\Users\zaima.nabi\OneDrive - Save the Children International\Documents\Zaima\CV sorting\full_data\output1\model-best"
-)
-
-# Default weighted ranking weights
 SEMANTIC_WEIGHT = 0.7
-TECH_WEIGHT = 0.3
+TECH_WEIGHT     = 0.3
 
 CATEGORIES = [
-    "Data Science", "Java Developer", "Testing", "DevOps Engineer",
-    "Python Developer", "Web Developer", "HR", "Hadoop", "Blockchain",
-    "ETL Developer", "Operations Manager", "Sales", "Mechanical Engineer",
-    "Arts", "Database", "Electrical Engineering", "Health and Fitness",
-    "PMO", "Business Analyst", "DotNet Developer", "Automation Testing",
-    "Network Security Engineer", "SAP Developer", "Civil Engineer", "Advocate"
+    "Data Science",
+    "Python Developer", "Web Developer", "Database", "DotNet Developer",
+    "Automation Testing", "Machine Learning Engineer", "DevOps Engineer",
+    "Mobile Developer", "Cloud Engineer",
 ]
 
 JD_TECH_FIELDS = [
@@ -70,9 +107,6 @@ PORTFOLIO_COLUMN_OPTIONS = [
     "Portfolio URL", "Website", "GitHub", "Github", "LinkedIn", "link", "url"
 ]
 
-# ──────────────────────────────────────────────
-# ALLOWED ORIGINS — edit to match your frontend
-# ──────────────────────────────────────────────
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:5173",
@@ -82,8 +116,6 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:8080",
     "http://127.0.0.1:4200",
-    # Add your production domain here, e.g.:
-    # "https://your-app.com",
 ]
 
 # ──────────────────────────────────────────────
@@ -92,12 +124,9 @@ ALLOWED_ORIGINS = [
 app = FastAPI(
     title="CV Screening API",
     description="AI-powered CV screening, ranking & portfolio extraction",
-    version="2.0.0"
+    version="2.1.0"
 )
 
-# ── CORS MIDDLEWARE ────────────────────────────────────────────────────────
-# NOTE: CORSMiddleware must be added BEFORE any other middleware.
-# Using explicit origins (not wildcard) so allow_credentials=True works.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -105,8 +134,30 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],
-    max_age=600,  # cache preflight for 10 minutes
+    max_age=600,
 )
+
+# ──────────────────────────────────────────────
+# SBERT: all-mpnet-base-v2 (768 → 384 via reducer)
+# ──────────────────────────────────────────────
+SBERT_MODEL_PATH = os.getenv(
+    "SBERT_MODEL_PATH",
+    r"C:\PROJECTS\models\sentence_trasnformers\trained_mpnet_resume"
+)
+# AFTER
+sbert_model = SentenceTransformer(SBERT_MODEL_PATH)
+
+# Detect output dimension so the reducer always projects to 384-dim,
+_sbert_out_dim = sbert_model.get_sentence_embedding_dimension()
+_sbert_reducer = nn.Linear(_sbert_out_dim, 384) if _sbert_out_dim != 384 else nn.Identity()
+_sbert_reducer.eval()
+
+def _sbert_embed(text: str) -> torch.Tensor:
+    """Encode with the locally trained sentence-transformer, then project to 384-dim."""
+    raw = sbert_model.encode(text[:512], convert_to_tensor=True)   # (_sbert_out_dim,)
+    with torch.no_grad():
+        reduced = _sbert_reducer(raw.unsqueeze(0))                  # (1, 384)
+    return reduced.squeeze(0)                                       # (384,)
 
 # ──────────────────────────────────────────────
 # Model cache
@@ -123,14 +174,11 @@ def get_models():
 
     print("Loading BERT...")
     tokenizer = AutoTokenizer.from_pretrained("SwaKyxd/resume-analyser-bert")
-    bert = AutoModelForSequenceClassification.from_pretrained("SwaKyxd/resume-analyser-bert")
+    bert      = AutoModelForSequenceClassification.from_pretrained("SwaKyxd/resume-analyser-bert")
     bert.eval()
 
-    print("Loading SBERT...")
-    sbert = SentenceTransformer("all-mpnet-base-v2")
-    reducer = nn.Linear(768, 384)
+    print(f"Loading SBERT from: {SBERT_MODEL_PATH} (dim={_sbert_out_dim})...")
 
-    # ── Load local spaCy NER model ─────────────────────────────────────────
     ner = None
     if os.path.exists(NER_MODEL_PATH):
         print(f"Loading NER model from: {NER_MODEL_PATH}")
@@ -144,25 +192,149 @@ def get_models():
 
     _models = {
         "tokenizer": tokenizer,
-        "bert": bert,
-        "sbert": sbert,
-        "reducer": reducer,
-        "groq": Groq(api_key=GROQ_API_KEY),
-        "ner": ner,
+        "bert":      bert,
+        "sbert":     sbert_model,
+        "reducer":   _sbert_reducer,
+        "groq":      Groq(api_key=GROQ_API_KEY),
+        "ner":       ner,
     }
     print("All models loaded ✓")
     return _models
 
 
-# ── NER skill extraction helper ────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Policy Model (RL)
+# ──────────────────────────────────────────────
+class ResumePolicy(nn.Module):
+    def __init__(self, input_dim=384, hidden_dim=128, num_actions=3):
+        super().__init__()
+        self.fc1     = nn.Linear(input_dim, hidden_dim)
+        self.relu    = nn.ReLU()
+        self.fc2     = nn.Linear(hidden_dim, num_actions)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        return self.softmax(self.fc2(x))
+
+policy_model     = ResumePolicy(input_dim=384, hidden_dim=128, num_actions=3)
+policy_optimizer = optim.Adam(policy_model.parameters(), lr=1e-4)
+ACTIONS          = ["use_designation_model", "use_experience_model", "combine_both"]
+
+def build_context_vector(designation_text, skills_text, experience_text):
+    combined = f"{designation_text}. {skills_text}. {experience_text}"
+    emb = _sbert_embed(combined)                        # (384,)
+    return emb.unsqueeze(0).requires_grad_(True)        # (1, 384)
+
+def reinforce_update(optimizer, log_prob, reward):
+    loss = -log_prob * reward
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+def policy_guided_resume_analysis(designation_text, skills_text, experience_text,
+                                   resume_text, training_mode=True):
+    ctx    = build_context_vector(designation_text, skills_text, experience_text)
+    probs  = policy_model(ctx)
+    dist   = Categorical(probs)
+    action = dist.sample()
+    log_prob       = dist.log_prob(action)
+    chosen_action  = ACTIONS[action.item()]
+
+    if chosen_action == "use_designation_model":
+        label, conf = run_designation_model(resume_text)
+        comp_cost   = 1.0
+    elif chosen_action == "use_experience_model":
+        label, conf = run_experience_model(resume_text)
+        comp_cost   = 0.8
+    else:
+        d_label, d_conf = run_designation_model(resume_text)
+        _,       e_conf = run_experience_model(resume_text)
+        label     = d_label
+        conf      = (d_conf + e_conf) / 2
+        comp_cost = 1.5
+
+    reward = conf - 0.1 * comp_cost
+    if training_mode:
+        reinforce_update(policy_optimizer, log_prob, reward)
+
+    return {
+        "action":       chosen_action,
+        "pred_label":   label,
+        "reward":       float(reward),
+        "accuracy":     float(conf),
+        "policy_probs": probs.detach().cpu().numpy().tolist()
+    }
+
+
+# ──────────────────────────────────────────────
+# Designation / Experience models
+# ──────────────────────────────────────────────
+_designation_tokenizer = None
+_designation_model     = None
+_experience_tokenizer  = None
+_experience_model      = None
+
+def _load_local_models():
+    global _designation_tokenizer, _designation_model
+    global _experience_tokenizer,  _experience_model
+
+    if _designation_model is None and os.path.exists(DESIGNATION_MODEL_PATH):
+        print("Loading designation model...")
+        _designation_tokenizer = AutoTokenizer.from_pretrained(DESIGNATION_MODEL_PATH)
+        _designation_model     = AutoModelForSequenceClassification.from_pretrained(DESIGNATION_MODEL_PATH)
+        _designation_model.eval()
+
+    if _experience_model is None and os.path.exists(EXPERIENCE_MODEL_PATH):
+        print("Loading experience model...")
+        _experience_tokenizer = AutoTokenizer.from_pretrained(EXPERIENCE_MODEL_PATH)
+        _experience_model     = AutoModelForSequenceClassification.from_pretrained(EXPERIENCE_MODEL_PATH)
+        _experience_model.eval()
+
+def run_designation_model(resume_text: str):
+    _load_local_models()
+    label_map = {0: "Business Analyst", 1: "Data Scientist", 2: "SQA", 3: "Web Developer"}
+    if _designation_model is None:
+        return "Unknown", 0.0
+    inputs = _designation_tokenizer(
+        resume_text, truncation=True, padding=True, max_length=512, return_tensors="pt"
+    )
+    with torch.no_grad():
+        logits = _designation_model(**inputs).logits
+        pred   = torch.argmax(logits, dim=-1).item()
+        score  = torch.softmax(logits, dim=-1)[0, pred].item()
+    return label_map.get(pred, "Unknown"), score
+
+def run_experience_model(resume_text: str):
+    _load_local_models()
+    label_map = {0: "Junior", 1: "Mid", 2: "Senior"}
+    if _experience_model is None:
+        return "Unknown", 0.0
+    inputs = _experience_tokenizer(
+        resume_text, truncation=True, padding=True, max_length=512, return_tensors="pt"
+    )
+    with torch.no_grad():
+        logits = _experience_model(**inputs).logits
+        pred   = torch.argmax(logits, dim=-1).item()
+        score  = torch.softmax(logits, dim=-1)[0, pred].item()
+    return label_map.get(pred, "Unknown"), score
+
+def infer_experience_level_with_model(resume_text: str) -> str:
+    label, _ = run_experience_model(resume_text)
+    return label
+
+
+# ──────────────────────────────────────────────
+# NER skill extraction
+# ──────────────────────────────────────────────
 NER_SKILL_LABELS = {"Skills", "Technology", "Designation", "Certifications"}
 
 def ner_extract_skills(text: str, ner_model) -> List[str]:
     if ner_model is None or not text.strip():
         return []
     try:
-        doc = ner_model(text[:1000])
-        skills: List[str] = []
+        doc    = ner_model(text[:1000])
+        skills = []
         for ent in doc.ents:
             if ent.label_ in NER_SKILL_LABELS:
                 for part in re.split(r"[,;|/]", ent.text):
@@ -174,68 +346,69 @@ def ner_extract_skills(text: str, ner_model) -> List[str]:
         print(f"NER extraction error: {e}")
         return []
 
+
 # ──────────────────────────────────────────────
 # Pydantic schemas
 # ──────────────────────────────────────────────
 class PortfolioResult(BaseModel):
-    url: str
-    type: str
-    summary: str
+    url:             str
+    type:            str
+    summary:         str
     skills_detected: List[str]
-    repos: Optional[List[Dict]]
-    error: Optional[str]
+    repos:           Optional[List[Dict]]
+    error:           Optional[str]
 
 class CVRankEntry(BaseModel):
-    rank: int
-    candidate_id: str
-    candidate_name: Optional[str] = None
-    candidate_email: Optional[str] = None
-    candidate_phone: Optional[str] = None
-    cv_text: Optional[str] = None
-    raw_row: Optional[Dict[str, Any]] = None
-
-    category: str
+    rank:                int
+    candidate_id:        str
+    candidate_name:      Optional[str] = None
+    candidate_email:     Optional[str] = None
+    candidate_phone:     Optional[str] = None
+    cv_text:             Optional[str] = None
+    raw_row:             Optional[Dict[str, Any]] = None
+    category:            str
     category_confidence: float
-    semantic_match_pct: float
-    tech_match_pct: float
-    priority_boost: float
-    total_score: float
-    matched_skills: List[str]
-    missing_skills: List[str]
-    portfolio_url: Optional[str]
-    portfolio_type: Optional[str]
-    portfolio_summary: Optional[str]
-    portfolio_skills: Optional[List[str]]
+    semantic_match_pct:  float
+    tech_match_pct:      float
+    priority_boost:      float
+    total_score:         float
+    matched_skills:      List[str]
+    missing_skills:      List[str]
+    portfolio_url:       Optional[str]
+    portfolio_type:      Optional[str]
+    portfolio_summary:   Optional[str]
+    portfolio_skills:    Optional[List[str]]
 
 class RankedCandidate(BaseModel):
-    rank: int
-    candidate: str
-    category: str
-    tech_match_pct: float
+    rank:               int
+    candidate:          str
+    category:           str
+    tech_match_pct:     float
     semantic_match_pct: float
-    total_score: float
-    matched_skills: List[str]
+    total_score:        float
+    matched_skills:     List[str]
 
 class RankingResponse(BaseModel):
-    jd_title: Optional[str]
-    jd_skills: List[str]
-    total_candidates: int
+    jd_title:           Optional[str]
+    jd_skills:          List[str]
+    total_candidates:   int
     portfolios_scraped: int
-    semantic_weight: float
-    tech_weight: float
-    ranked_table: List[RankedCandidate]
-    rankings: List[CVRankEntry]
+    semantic_weight:    float
+    tech_weight:        float
+    ranked_table:       List[RankedCandidate]
+    rankings:           List[CVRankEntry]
 
 class JDExtractResponse(BaseModel):
-    filename: str
+    filename:  str
     extracted: Dict[str, Any]
 
 class HealthResponse(BaseModel):
-    status: str
+    status:        str
     models_loaded: bool
 
+
 # ══════════════════════════════════════════════
-# ── PORTFOLIO SCRAPING ─────────────────────────
+# PORTFOLIO SCRAPING
 # ══════════════════════════════════════════════
 
 def normalize_url(raw: str) -> Optional[str]:
@@ -252,10 +425,8 @@ def normalize_url(raw: str) -> Optional[str]:
 
 def detect_portfolio_type(url: str) -> str:
     u = url.lower()
-    if "github.com" in u:
-        return "github"
-    if "linkedin.com" in u:
-        return "linkedin"
+    if "github.com"   in u: return "github"
+    if "linkedin.com" in u: return "linkedin"
     return "website"
 
 def scrape_website_text(url: str, timeout: int = 12) -> str:
@@ -291,12 +462,12 @@ def fetch_github_repos(username: str, max_repos: int = 8) -> List[Dict]:
             return []
         return [
             {
-                "name": repo.get("name", ""),
+                "name":        repo.get("name", ""),
                 "description": repo.get("description") or "",
-                "language": repo.get("language") or "",
-                "topics": repo.get("topics", []) if isinstance(repo.get("topics", []), list) else [],
-                "stars": repo.get("stargazers_count", 0),
-                "url": repo.get("html_url", ""),
+                "language":    repo.get("language") or "",
+                "topics":      repo.get("topics", []),
+                "stars":       repo.get("stargazers_count", 0),
+                "url":         repo.get("html_url", ""),
             }
             for repo in r.json()
         ]
@@ -351,19 +522,19 @@ Text:
 
 def scrape_portfolio(url: str, groq_client) -> Dict:
     clean = normalize_url(url)
-    base = {
-        "url": clean or url,
-        "type": "unknown",
-        "summary": "",
+    base  = {
+        "url":             clean or url,
+        "type":            "unknown",
+        "summary":         "",
         "skills_detected": [],
-        "repos": None,
-        "error": None,
+        "repos":           None,
+        "error":           None,
     }
     if not clean:
         base["error"] = "Invalid URL"
         return base
 
-    ptype = detect_portfolio_type(clean)
+    ptype        = detect_portfolio_type(clean)
     base["type"] = ptype
 
     try:
@@ -372,54 +543,48 @@ def scrape_portfolio(url: str, groq_client) -> Dict:
             if not username:
                 base["error"] = "Cannot extract GitHub username"
                 return base
-
-            repos = fetch_github_repos(username)
+            repos        = fetch_github_repos(username)
             base["repos"] = repos
-
             readme_texts = []
             for repo in sorted(repos, key=lambda r: r["stars"], reverse=True)[:3]:
                 txt = fetch_github_readme(username, repo["name"])
                 if txt:
                     readme_texts.append(f"[{repo['name']}]\n{txt}")
                 time.sleep(0.3)
-
             repo_lines = "\n".join(
                 f"{r['name']} ({r['language']}): {r['description']}"
                 for r in repos if r.get("description")
             )
-            combined = (
-                f"GitHub: {username}\n\nRepos:\n{repo_lines}\n\nREADMEs:\n"
-                + "\n\n".join(readme_texts)
-            )
-            base["summary"] = llm_summarize(combined, "GitHub", groq_client)
+            combined                = f"GitHub: {username}\n\nRepos:\n{repo_lines}\n\nREADMEs:\n" + "\n\n".join(readme_texts)
+            base["summary"]         = llm_summarize(combined, "GitHub", groq_client)
             base["skills_detected"] = llm_extract_skills(combined, groq_client)
 
         elif ptype == "linkedin":
             text = scrape_website_text(clean)
             if text.startswith("ERROR"):
-                base["error"] = "LinkedIn blocked scraping (expected)"
+                base["error"]   = "LinkedIn blocked scraping (expected)"
                 base["summary"] = "LinkedIn profile — scraping blocked by LinkedIn"
             else:
-                base["summary"] = llm_summarize(text, "LinkedIn", groq_client)
+                base["summary"]         = llm_summarize(text, "LinkedIn", groq_client)
                 base["skills_detected"] = llm_extract_skills(text, groq_client)
-
         else:
             text = scrape_website_text(clean)
             if text.startswith("ERROR"):
-                base["error"] = text
+                base["error"]   = text
                 base["summary"] = "Could not fetch website"
             else:
-                base["summary"] = llm_summarize(text, "portfolio website", groq_client)
+                base["summary"]         = llm_summarize(text, "portfolio website", groq_client)
                 base["skills_detected"] = llm_extract_skills(text, groq_client)
 
     except Exception as e:
-        base["error"] = str(e)
+        base["error"]   = str(e)
         base["summary"] = f"Extraction failed: {e}"
 
     return base
 
+
 # ══════════════════════════════════════════════
-# ── CORE PIPELINE UTILS ────────────────────────
+# CORE PIPELINE UTILS
 # ══════════════════════════════════════════════
 
 def extract_pdf_text(path: str) -> str:
@@ -445,6 +610,15 @@ def extract_pdf_text(path: str) -> str:
             print(f"PyPDF2: {e}")
 
     return re.sub(r"\s+", " ", text).strip()
+
+def read_word_resume(word_doc: str) -> Optional[str]:
+    try:
+        text = docx2txt.process(word_doc)
+        text = ''.join(str(text)).replace("\n", "")
+        return text if text.strip() else None
+    except Exception as e:
+        print(f"Error reading {word_doc}: {e}")
+        return None
 
 def truncate(text: str, n: int) -> str:
     if len(text) <= n:
@@ -473,6 +647,49 @@ def call_groq(prompt: str, groq_client, retries=3, delay=3) -> str:
 
 def normalize_skill(s: str) -> str:
     return re.sub(r"\s+", " ", s.lower().strip())
+
+
+# ──────────────────────────────────────────────
+# DATE / DURATION HELPERS
+# ──────────────────────────────────────────────
+
+def parse_duration(text: str) -> float:
+    text = text.lower()
+    text = (text.replace('yrs', 'years').replace('yr', 'year')
+                .replace('mos', 'months').replace('mo', 'month'))
+    matches = re.findall(r'(\d+(?:\.\d+)?)\s*(year|month|week|day)s?', text)
+    months  = 0.0
+    for value, unit in matches:
+        val = float(value)
+        if   'year'  in unit: months += val * 12
+        elif 'month' in unit: months += val
+        elif 'week'  in unit: months += val / 4.345
+        elif 'day'   in unit: months += val / 30
+    return round(months)
+
+def parse_date_range(start_str: str, end_str: str) -> float:
+    try:
+        start = date_parser.parse(start_str.strip(), fuzzy=True)
+        try:
+            end = date_parser.parse(end_str.strip(), fuzzy=True)
+        except Exception:
+            end = datetime.today()
+        diff = relativedelta(end, start)
+        return diff.years * 12 + diff.months + diff.days / 30
+    except Exception:
+        return 0.0
+
+def months_to_string(months: float) -> str:
+    months = round(months, 2)
+    if months < 1:
+        return f"{round(months * 30)} days"
+    years      = int(months // 12)
+    rem_months = int(months % 12)
+    result     = []
+    if years      > 0: result.append(f"{years} year{'s' if years > 1 else ''}")
+    if rem_months > 0: result.append(f"{rem_months} month{'s' if rem_months > 1 else ''}")
+    return ' '.join(result) if result else "0 months"
+
 
 # ──────────────────────────────────────────────
 # PRIORITY BOOST HELPERS
@@ -517,20 +734,6 @@ REWARD_KEYWORDS_BY_ROLE = {
 def _get_max_rank(text: str, rank_map: dict) -> float:
     return max((v for k, v in rank_map.items() if k in text.lower()), default=0.0)
 
-def _parse_experience_months(text: str) -> float:
-    text = text.lower()
-    text = (text.replace('yrs', 'years').replace('yr', 'year')
-                .replace('mos', 'months').replace('mo', 'month'))
-    matches = re.findall(r'(\d+(?:\.\d+)?)\s*(year|month|week|day)s?', text)
-    months = 0.0
-    for value, unit in matches:
-        val = float(value)
-        if 'year'  in unit: months += val * 12
-        elif 'month' in unit: months += val
-        elif 'week'  in unit: months += val / 4.345
-        elif 'day'   in unit: months += val / 30
-    return round(months)
-
 def _infer_primary_role(designation_text: str) -> str:
     role_keywords = {
         'web_developer':     ['web developer', 'frontend', 'backend', 'full stack', 'react', 'angular'],
@@ -567,16 +770,16 @@ def compute_priority_boost(meta: dict, matched_skills: List[str]) -> float:
 
     primary_role = _infer_primary_role(designation_text)
 
-    exp_months = _parse_experience_months(experience_text)
+    exp_months = parse_duration(experience_text)
     boost += min(exp_months / 12, 10.0)
 
     boost += _get_max_rank(designation_text, DESIGNATION_RANK)
-    boost += _get_max_rank(companies_text, TOP_COMPANIES)
-    boost += _get_max_rank(education_text, DEGREE_RANK)
-    boost += _get_max_rank(college_text, COLLEGE_RANK)
-    boost += _get_max_rank(projects_text, PROJECT_KEYWORDS_BY_ROLE.get(primary_role, {}))
-    boost += _get_max_rank(certs_text,    CERT_KEYWORDS_BY_ROLE.get(primary_role, {}))
-    boost += _get_max_rank(rewards_text,  REWARD_KEYWORDS_BY_ROLE.get(primary_role, {}))
+    boost += _get_max_rank(companies_text,   TOP_COMPANIES)
+    boost += _get_max_rank(education_text,   DEGREE_RANK)
+    boost += _get_max_rank(college_text,     COLLEGE_RANK)
+    boost += _get_max_rank(projects_text,    PROJECT_KEYWORDS_BY_ROLE.get(primary_role, {}))
+    boost += _get_max_rank(certs_text,       CERT_KEYWORDS_BY_ROLE.get(primary_role, {}))
+    boost += _get_max_rank(rewards_text,     REWARD_KEYWORDS_BY_ROLE.get(primary_role, {}))
 
     if matched_skills:
         boost += 3.0
@@ -588,27 +791,53 @@ def parse_skills_str(raw) -> List[str]:
         return []
     return [normalize_skill(s) for s in re.split(r"[,;|]", str(raw)) if s.strip()]
 
-def fuzzy_skill_match(cv_skills, jd_skills, threshold=80):
+def fuzzy_skill_match(
+    cv_skills: List[str],
+    jd_skills: List[str],
+    threshold: int = 80,
+) -> tuple:
     if not jd_skills:
         return 0.0, [], []
+    if not cv_skills:
+        return 0.0, [], list(jd_skills)
+
     matched, missing = [], []
     for jd_s in jd_skills:
         best = max(
-            (max(fuzz.ratio(jd_s, c), fuzz.partial_ratio(jd_s, c),
-                 fuzz.token_sort_ratio(jd_s, c), fuzz.token_set_ratio(jd_s, c))
-             for c in cv_skills),
+            (
+                max(
+                    fuzz.ratio(jd_s, c),
+                    fuzz.token_sort_ratio(jd_s, c),
+                    fuzz.token_set_ratio(jd_s, c),
+                )
+                for c in cv_skills
+            ),
             default=0,
         )
         (matched if best >= threshold else missing).append(jd_s)
+
     pct = round(len(matched) / len(jd_skills) * 100, 2)
     return pct, matched, missing
+
+def extract_skills_from_text(text: str) -> List[str]:
+    tokens = re.split(r"[,;|\n]", text)
+    skills = []
+    for t in tokens:
+        t = t.strip()
+        if not t or len(t.split()) > 4 or t.isdigit():
+            continue
+        if re.search(r"\b(is|are|was|were|have|has|had|will|would|can|could|the|and|or|to|in|of|for|with)\b", t.lower()):
+            continue
+        skills.append(normalize_skill(t))
+    seen = set()
+    return [s for s in skills if not (s in seen or seen.add(s))]
 
 def predict_category(text: str, models):
     tok, bert = models["tokenizer"], models["bert"]
     inp = tok(text[:512], truncation=True, padding=True, max_length=512, return_tensors="pt")
     with torch.no_grad():
         probs = torch.softmax(bert(**inp).logits, dim=1)
-        idx = torch.argmax(probs, dim=1).item()
+        idx   = torch.argmax(probs, dim=1).item()
     return (CATEGORIES[idx] if idx < len(CATEGORIES) else "Unknown"), round(probs[0][idx].item(), 4)
 
 def extract_jd_json(text: str, groq_client) -> dict:
@@ -627,8 +856,9 @@ JD:
     except json.JSONDecodeError:
         return {"error": "JSON parse failed", "raw": raw[:500]}
 
+
 # ══════════════════════════════════════════════
-# ── ROUTES ────────────────────────────────────
+# ROUTES
 # ══════════════════════════════════════════════
 
 @app.get("/")
@@ -639,13 +869,8 @@ def root():
 def health():
     return {"status": "ok", "models_loaded": bool(_models)}
 
-# ── Explicit OPTIONS handler for preflight (belt-and-suspenders) ───────────
 @app.options("/{full_path:path}")
 async def options_handler(full_path: str):
-    """
-    FastAPI's CORSMiddleware handles OPTIONS automatically, but this explicit
-    handler ensures preflight responses are returned even if routing fails.
-    """
     return {}
 
 @app.post("/load-models")
@@ -671,7 +896,7 @@ async def extract_jd(file: UploadFile = File(...)):
 
 @app.post("/extract-portfolio", response_model=PortfolioResult)
 async def extract_portfolio_endpoint(url: str = Form(...)):
-    models = get_models()
+    models  = get_models()
     cleaned = normalize_url(url)
     if not cleaned:
         raise HTTPException(400, "Invalid or empty URL")
@@ -679,15 +904,14 @@ async def extract_portfolio_endpoint(url: str = Form(...)):
 
 @app.post("/rank-cvs", response_model=RankingResponse)
 async def rank_cvs(
-    jd_file: UploadFile = File(...),
-    cv_file: UploadFile = File(...),
-    extract_portfolios: bool = Form(False),
-    semantic_weight: float = Form(SEMANTIC_WEIGHT),
-    tech_weight: float = Form(TECH_WEIGHT),
+    jd_file:            UploadFile = File(...),
+    cv_file:            UploadFile = File(...),
+    extract_portfolios: bool  = Form(False),
+    semantic_weight:    float = Form(SEMANTIC_WEIGHT),
+    tech_weight:        float = Form(TECH_WEIGHT),
 ):
     models = get_models()
 
-    # Normalise weights so they always sum to exactly 1.0
     total_w = semantic_weight + tech_weight
     if total_w <= 0:
         semantic_weight, tech_weight = SEMANTIC_WEIGHT, TECH_WEIGHT
@@ -703,16 +927,16 @@ async def rank_cvs(
         cv_path = cv_tmp.name
 
     try:
-        # ── 1. Extract JD ──────────────────────────────────────────────────────
+        # ── 1. Extract JD ──────────────────────────────────────────────────
         jd_text = extract_pdf_text(jd_path)
         if not jd_text or len(jd_text) < 50:
             raise HTTPException(422, "Could not extract text from JD PDF")
-        jd_data = extract_jd_json(jd_text, models["groq"])
+        jd_data   = extract_jd_json(jd_text, models["groq"])
         jd_skills = parse_skills_str(
             next((jd_data[f] for f in JD_TECH_FIELDS if f in jd_data and jd_data[f]), "")
         )
 
-        # ── 2. Load CSV ────────────────────────────────────────────────────────
+        # ── 2. Load CSV ────────────────────────────────────────────────────
         df = pd.read_csv(cv_path).fillna("")
 
         skills_col = next(
@@ -736,6 +960,7 @@ async def rank_cvs(
         cv_ids, cv_texts, cv_skills_list, cv_port_urls, cv_meta_rows = [], [], [], [], []
 
         for idx, row in df.iterrows():
+            # Candidate ID
             raw_id = None
             if id_col and str(row.get(id_col)).strip():
                 raw_id = str(row[id_col])
@@ -748,6 +973,7 @@ async def rank_cvs(
                 raw_id = f"row_{idx}"
             cv_ids.append(raw_id)
 
+            # Resume text
             resume_text = ""
             for c in RESUME_COL_CANDIDATES + ["Summary", "Profile", "About", "Bio"]:
                 if c in df.columns and str(row.get(c)).strip():
@@ -755,12 +981,20 @@ async def rank_cvs(
                     break
             if not resume_text:
                 resume_text = " | ".join(str(v) for v in row.values if str(v).strip())
-
             cv_texts.append(resume_text[:MAX_CHARS_CV])
-            cv_skills_list.append(parse_skills_str(str(row[skills_col]) if skills_col else ""))
-            cv_port_urls.append(normalize_url(str(row[portfolio_col])) if portfolio_col else None)
 
-            raw_row = {}
+            # Skill extraction
+            if skills_col and str(row.get(skills_col, "")).strip():
+                explicit_skills = parse_skills_str(str(row[skills_col]))
+            else:
+                explicit_skills = extract_skills_from_text(resume_text)
+            cv_skills_list.append(explicit_skills)
+
+            cv_port_urls.append(
+                normalize_url(str(row[portfolio_col])) if portfolio_col else None
+            )
+
+            raw_row: Dict[str, Any] = {}
             for k, v in row.items():
                 try:
                     raw_row[str(k)] = v if (v is not None and (not pd.isna(v))) else ""
@@ -771,7 +1005,7 @@ async def rank_cvs(
         if not cv_texts:
             raise HTTPException(422, "No CV records found in CSV")
 
-        # ── 3. Optional portfolio scraping ────────────────────────────────────
+        # ── 3. Optional portfolio scraping ────────────────────────────────
         port_cache: Dict[str, Dict] = {}
         if extract_portfolios and portfolio_col:
             unique = list({u for u in cv_port_urls if u})
@@ -781,121 +1015,128 @@ async def rank_cvs(
                 port_cache[u] = scrape_portfolio(u, models["groq"])
                 time.sleep(2)
 
-        # ── 4. Semantic embeddings ────────────────────────────────────────────
+        # ── 4. Semantic embeddings (all-mpnet-base-v2 → 384-dim) ──────────
         def embed(text):
-            return models["reducer"](
-                torch.tensor(models["sbert"].encode(text[:512], convert_to_tensor=True)).unsqueeze(0)
-            ).detach()
+            return _sbert_embed(text[:512])   # (384,)
 
-        jd_emb = embed(jd_text)
-        cv_embs = torch.stack([embed(t).squeeze(0) for t in cv_texts])
+        jd_emb          = embed(jd_text)
+        cv_embs         = torch.stack([embed(t) for t in cv_texts])
         semantic_scores = [
-            round(util.cos_sim(jd_emb, e.unsqueeze(0)).item() * 100, 2) for e in cv_embs
+            round(util.cos_sim(jd_emb.unsqueeze(0), e.unsqueeze(0)).item() * 100, 2)
+            for e in cv_embs
         ]
 
-        # ── 5. Category prediction ────────────────────────────────────────────
+        # ── 5. Category prediction ─────────────────────────────────────────
         cat_results = [predict_category(t[:512], models) for t in cv_texts]
 
-        # ── 5b. NER skill extraction ──────────────────────────────────────────
+        # ── 5b. NER skill extraction ───────────────────────────────────────
         ner_skills_list: List[List[str]] = []
         if models.get("ner"):
             print("Extracting skills via NER model...")
             for t in cv_texts:
                 ner_skills_list.append(ner_extract_skills(t, models["ner"]))
-            ner_count = sum(len(s) for s in ner_skills_list)
-            print(f"NER extracted {ner_count} skill mentions across {len(cv_texts)} CVs")
         else:
             ner_skills_list = [[] for _ in cv_texts]
 
-        # ── 6. Build candidate rows ───────────────────────────────────────────
+        # ── 6. Build candidate rows ────────────────────────────────────────
         rows = []
         for i, cid in enumerate(cv_ids):
             port_url  = cv_port_urls[i]
             port_data = port_cache.get(port_url, {}) if port_url else {}
 
-            augmented = (
-                list(set(cv_skills_list[i] + [normalize_skill(s) for s in port_data["skills_detected"]]))
-                if port_data.get("skills_detected") else cv_skills_list[i]
-            )
-
+            augmented = list(cv_skills_list[i])
+            if port_data.get("skills_detected"):
+                augmented = list(set(augmented + [
+                    normalize_skill(s) for s in port_data["skills_detected"]
+                ]))
             if ner_skills_list[i]:
                 augmented = list(set(augmented + ner_skills_list[i]))
 
             tech_pct, matched, missing = fuzzy_skill_match(augmented, jd_skills)
-            sem_pct = semantic_scores[i]
-            meta = cv_meta_rows[i]
+            sem_pct        = semantic_scores[i]
+            meta           = cv_meta_rows[i]
             priority_boost = compute_priority_boost(meta, matched)
-            total_score = round(sem_w * sem_pct + tec_w * tech_pct + priority_boost, 2)
+            total_score    = round(sem_w * sem_pct + tec_w * tech_pct + priority_boost, 2)
 
             candidate_name = next(
-                (str(meta[c]).strip() for c in NAME_COL_CANDIDATES if c in meta and str(meta[c]).strip()), ""
+                (str(meta[c]).strip() for c in NAME_COL_CANDIDATES
+                 if c in meta and str(meta[c]).strip()), ""
             )
             candidate_email = next(
-                (str(meta[c]).strip() for c in EMAIL_COL_CANDIDATES if c in meta and str(meta[c]).strip()), ""
+                (str(meta[c]).strip() for c in EMAIL_COL_CANDIDATES
+                 if c in meta and str(meta[c]).strip()), ""
             )
             candidate_phone = next(
-                (str(meta[c]).strip() for c in PHONE_COL_CANDIDATES if c in meta and str(meta[c]).strip()), ""
+                (str(meta[c]).strip() for c in PHONE_COL_CANDIDATES
+                 if c in meta and str(meta[c]).strip()), ""
+            )
+
+            # Policy-guided role & experience inference
+            designation_text = str(meta.get("Designation", meta.get("designation", "")))
+            skills_text      = str(meta.get("Skills", meta.get("skills", "")))
+            experience_text  = str(meta.get("Experience", meta.get("experience", "")))
+
+            policy_output = policy_guided_resume_analysis(
+                designation_text, skills_text, experience_text,
+                cv_texts[i], training_mode=False
             )
 
             rows.append({
-                "rank": 0,
-                "candidate_id": cid,
-                "candidate_name": candidate_name,
-                "candidate_email": candidate_email,
-                "candidate_phone": candidate_phone,
-                "cv_text": cv_texts[i],
-                "raw_row": meta,
-                "category": cat_results[i][0],
+                "rank":                0,
+                "candidate_id":        cid,
+                "candidate_name":      candidate_name,
+                "candidate_email":     candidate_email,
+                "candidate_phone":     candidate_phone,
+                "cv_text":             cv_texts[i],
+                "raw_row":             meta,
+                "category":            policy_output["pred_label"] or cat_results[i][0],
                 "category_confidence": cat_results[i][1],
-                "semantic_match_pct": sem_pct,
-                "tech_match_pct": tech_pct,
-                "priority_boost": priority_boost,
-                "total_score": total_score,
-                "matched_skills": matched,
-                "missing_skills": missing,
-                "portfolio_url": port_url,
-                "portfolio_type": port_data.get("type"),
-                "portfolio_summary": port_data.get("summary") or None,
-                "portfolio_skills": port_data.get("skills_detected") or None,
+                "semantic_match_pct":  sem_pct,
+                "tech_match_pct":      tech_pct,
+                "priority_boost":      priority_boost,
+                "total_score":         total_score,
+                "matched_skills":      matched,
+                "missing_skills":      missing,
+                "portfolio_url":       port_url,
+                "portfolio_type":      port_data.get("type"),
+                "portfolio_summary":   port_data.get("summary") or None,
+                "portfolio_skills":    port_data.get("skills_detected") or None,
             })
 
-        # ── 7. Sort & assign ranks ────────────────────────────────────────────
+        # ── 7. Sort & assign ranks ─────────────────────────────────────────
         rows.sort(key=lambda x: x["total_score"], reverse=True)
         for rank, row in enumerate(rows, 1):
             row["rank"] = rank
 
-        # ── 8. Build slim ranked_table ────────────────────────────────────────
+        # ── 8. Build slim ranked_table ─────────────────────────────────────
         ranked_table = []
         for row in rows:
-            display_name = (
-                row["candidate_name"]
-                or row["candidate_email"]
-                or row["candidate_id"]
-            )
+            display_name = row["candidate_name"] or row["candidate_email"] or row["candidate_id"]
             ranked_table.append({
-                "rank": row["rank"],
-                "candidate": display_name,
-                "category": row["category"],
-                "tech_match_pct": row["tech_match_pct"],
+                "rank":               row["rank"],
+                "candidate":          display_name,
+                "category":           row["category"],
+                "tech_match_pct":     row["tech_match_pct"],
                 "semantic_match_pct": row["semantic_match_pct"],
-                "total_score": row["total_score"],
-                "matched_skills": row["matched_skills"],
+                "total_score":        row["total_score"],
+                "matched_skills":     row["matched_skills"],
             })
 
         return {
-            "jd_title": jd_data.get("Job_Title", ""),
-            "jd_skills": jd_skills,
-            "total_candidates": len(rows),
+            "jd_title":           jd_data.get("Job_Title", ""),
+            "jd_skills":          jd_skills,
+            "total_candidates":   len(rows),
             "portfolios_scraped": len(port_cache),
-            "semantic_weight": sem_w,
-            "tech_weight": tec_w,
-            "ranked_table": ranked_table,
-            "rankings": rows,
+            "semantic_weight":    sem_w,
+            "tech_weight":        tec_w,
+            "ranked_table":       ranked_table,
+            "rankings":           rows,
         }
 
     finally:
         os.unlink(jd_path)
         os.unlink(cv_path)
+
 
 @app.post("/skill-match")
 def skill_match_endpoint(
@@ -908,10 +1149,10 @@ def skill_match_endpoint(
     pct, matched, missing = fuzzy_skill_match(cv_list, jd_list, threshold)
     return {
         "match_pct": pct,
-        "matched": matched,
-        "missing": missing,
-        "cv_count": len(cv_list),
-        "jd_count": len(jd_list),
+        "matched":   matched,
+        "missing":   missing,
+        "cv_count":  len(cv_list),
+        "jd_count":  len(jd_list),
     }
 
 @app.get("/categories")

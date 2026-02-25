@@ -1,0 +1,26 @@
+fastapi
+uvicorn[standard]
+python-multipart
+torch --index-url https://download.pytorch.org/whl/cpu
+transformers
+sentence-transformers
+spacy
+pdfplumber
+PyPDF2
+python-docx
+docx2txt
+pyresparser
+pandas
+openpyxl
+pytesseract
+opencv-python
+nltk
+gensim
+scikit-learn
+wordcloud
+matplotlib
+rapidfuzz
+requests
+beautifulsoup4
+python-dateutil
+groq

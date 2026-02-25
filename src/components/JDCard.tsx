@@ -1,16 +1,33 @@
+import { useState } from "react";
 import { JobDescription } from "@/data/mockData";
-import { MapPin, Briefcase, GraduationCap, DollarSign, Users, ChevronRight } from "lucide-react";
+import { MapPin, Briefcase, DollarSign, Users, ChevronRight, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 
 interface JDCardProps {
   jd: JobDescription;
   isSelected: boolean;
   onSelect: () => void;
+  onDelete?: () => void;
   candidateCount: number;
 }
 
-export function JDCard({ jd, isSelected, onSelect, candidateCount }: JDCardProps) {
+export function JDCard({ jd, isSelected, onSelect, onDelete, candidateCount }: JDCardProps) {
+  const [confirming, setConfirming] = useState(false);
   const techSkills = jd.Technology.split(",").map(s => s.trim()).filter(Boolean);
+
+  const handleDeleteClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (confirming) {
+      onDelete?.();
+    } else {
+      setConfirming(true);
+    }
+  };
+
+  const handleCancelDelete = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setConfirming(false);
+  };
 
   return (
     <div
@@ -22,7 +39,7 @@ export function JDCard({ jd, isSelected, onSelect, candidateCount }: JDCardProps
       }`}
     >
       <div className="flex items-start justify-between gap-2 mb-3">
-        <div>
+        <div className="min-w-0">
           <h3 className="font-semibold text-foreground text-sm leading-tight">{jd.Job_Title}</h3>
           <p className="text-xs text-muted-foreground mt-0.5">{jd.Company}</p>
         </div>
@@ -60,9 +77,42 @@ export function JDCard({ jd, isSelected, onSelect, candidateCount }: JDCardProps
           <Users className="w-3 h-3" />
           {candidateCount} candidates
         </span>
-        <span className="text-[10px] text-muted-foreground">
-          {new Date(jd.processedAt).toLocaleDateString()}
-        </span>
+
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-muted-foreground">
+            {new Date(jd.processedAt).toLocaleDateString()}
+          </span>
+
+          {/* Delete button — only shown if onDelete is provided */}
+          {onDelete && (
+            confirming ? (
+              <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
+                <button
+                  className="text-[10px] font-semibold text-destructive hover:underline"
+                  onClick={handleDeleteClick}
+                >
+                  Confirm
+                </button>
+                <span className="text-muted-foreground text-[10px]">/</span>
+                <button
+                  className="text-[10px] text-muted-foreground hover:underline"
+                  onClick={handleCancelDelete}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                className="flex items-center gap-0.5 text-[10px] text-muted-foreground hover:text-destructive transition-colors font-medium"
+                onClick={handleDeleteClick}
+                title="Delete this JD and all its candidates"
+              >
+                <Trash2 className="w-3 h-3" />
+                Delete
+              </button>
+            )
+          )}
+        </div>
       </div>
     </div>
   );
