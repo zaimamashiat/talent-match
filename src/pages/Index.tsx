@@ -34,18 +34,30 @@ import type { ApiCVRankEntry, UIJD, UICandidate } from "@/lib/types";
 
 type View = "dashboard" | "jds" | "candidates" | "analytics" | "upload" | "settings";
 
-function mapApiCandidatesToTable(entries: ApiCVRankEntry[]): UICandidate[] {
+function mapApiCandidatesToTable(
+  entries: ApiCVRankEntry[],
+  areaOfInterestMap: Record<string, string> = {}
+): UICandidate[] {
   return entries.map((e) => {
     const displayName =
       e.candidate_name?.trim() ||
       e.candidate_email?.trim() ||
       e.candidate_id;
 
+    // Try to resolve AOI: prefer email key, fall back to candidate_id key
+    const aoiKey = e.candidate_email?.trim() || e.candidate_id;
+    const area_of_interest =
+      areaOfInterestMap[aoiKey] ??
+      areaOfInterestMap[e.candidate_id] ??
+      (e as any).area_of_interest ??
+      "";
+
     return {
       ...e,
       id: e.candidate_id,
       name: displayName,
       email: e.candidate_email || "",
+      area_of_interest,
     };
   });
 }
@@ -85,11 +97,15 @@ function resolveDisplayName(c: UICandidate): string {
 }
 
 /**
- * Download candidates as a CSV file.
+ * Download candidates as a CSV file — includes Area of Interest column.
  */
 function downloadCandidatesCSV(candidates: UICandidate[], jdTitle: string) {
+  const hasAoi = candidates.some((c) => (c as any).area_of_interest);
+
   const headers = [
-    "Rank", "Name", "Email", "Category", "Tech Match (%)",
+    "Rank", "Name", "Email",
+    ...(hasAoi ? ["Area of Interest"] : []),
+    "Category", "Tech Match (%)",
     "Semantic Match (%)", "Matched Skills", "Missing Skills", "Portfolio URL",
   ];
 
@@ -104,6 +120,7 @@ function downloadCandidatesCSV(candidates: UICandidate[], jdTitle: string) {
     escape(c.rank),
     escape(resolveDisplayName(c)),
     escape(c.candidate_email ?? c.email ?? ""),
+    ...(hasAoi ? [escape((c as any).area_of_interest ?? "")] : []),
     escape(c.category),
     escape(c.tech_match_pct),
     escape(c.semantic_match_pct),
@@ -126,8 +143,6 @@ function downloadCandidatesCSV(candidates: UICandidate[], jdTitle: string) {
 /**
  * Build a RankingResponse-compatible object from the Index's stored state
  * so AnalyticsView receives properly-shaped data across ALL JDs.
- *
- * ✅ Removed: priority_boost, total_score
  */
 function buildAnalyticsData(
   jds: UIJD[],
@@ -160,7 +175,6 @@ function buildAnalyticsData(
     portfolio_type: c.portfolio_type,
     portfolio_summary: c.portfolio_summary,
     portfolio_skills: c.portfolio_skills,
-  
   }));
 
   const portfolios_scraped = rankings.filter((r) => r.portfolio_url).length;
@@ -260,19 +274,13 @@ export default function Index() {
     if (selectedJdId === jdId) setSelectedJdId(null);
   };
 
-  /**
-   * ✅ NEW: Delete the entire ranking list for a JD (clears candidates for that JD only)
-   */
+  /** Delete the entire ranking list for a JD (clears candidates for that JD only) */
   const handleDeleteRanking = (jdId: string) => {
     const ok = window.confirm(
       "Delete all ranked candidates for this Job Description?\n\nThis will clear the entire ranking list, but keep the JD."
     );
     if (!ok) return;
-
-    setCandidatesByJd((prev) => ({
-      ...prev,
-      [jdId]: [],
-    }));
+    setCandidatesByJd((prev) => ({ ...prev, [jdId]: [] }));
   };
 
   return (
@@ -362,7 +370,7 @@ export default function Index() {
                 portfoliosScraped={portfoliosScraped}
               />
 
-              <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+              <div className="grid grid-cols-1 xl:grid-cols-4 gap-6">
                 {/* ── JD List ─────────────────────────────────────────────── */}
                 <div className="xl:col-span-1 space-y-3">
                   <div className="flex items-center justify-between">
@@ -404,7 +412,7 @@ export default function Index() {
                 </div>
 
                 {/* ── Rankings Panel ──────────────────────────────────────── */}
-                <div className="xl:col-span-2 space-y-3">
+                <div className="xl:col-span-3 space-y-3">
                   <div className="flex items-center justify-between">
                     <div>
                       <h2 className="text-sm font-semibold text-foreground">
@@ -428,7 +436,6 @@ export default function Index() {
                         </span>
                       )}
 
-                      {/* ✅ NEW: Delete entire ranking for the selected JD */}
                       {selectedJD && (candidatesByJd[selectedJD.id]?.length ?? 0) > 0 && (
                         <button
                           onClick={() => handleDeleteRanking(selectedJD.id)}
@@ -559,7 +566,6 @@ export default function Index() {
                 </div>
 
                 <div className="flex items-center gap-2">
-                  {/* ✅ NEW: Clear ranking from Candidates view too */}
                   {selectedJD && (candidatesByJd[selectedJD.id]?.length ?? 0) > 0 && (
                     <button
                       onClick={() => handleDeleteRanking(selectedJD.id)}
@@ -651,37 +657,57 @@ export default function Index() {
           {activeView === "upload" && (
             <UploadView
               onCancel={() => setActiveView("dashboard")}
-              onSubmit={({ jdExtracted, ranking }) => {
-                const id = crypto.randomUUID();
-
-                const Job_Title = pickField(
-                  jdExtracted as Record<string, unknown>,
-                  ["Job_Title", "JobTitle", "job_title", "title"],
-                  "Untitled JD"
-                );
-                const Company = pickField(
-                  jdExtracted as Record<string, unknown>,
-                  ["Company", "company", "organisation", "organization"],
-                  ""
-                );
-                const Location = pickField(
-                  jdExtracted as Record<string, unknown>,
-                  ["Location", "location", "city", "country"],
-                  ""
-                );
-                const Technology = pickField(
-                  jdExtracted as Record<string, unknown>,
-                  ["Technology", "technologies", "Technical Skills", "Technical_Skills",
-                   "tech_skills", "Required_Skills", "Skills", "skills"],
-                  ""
+              onSubmit={({ jdFiles, jdExtractedList, ranking, areaOfInterestMap }) => {
+                // Map candidates once with AOI, shared across all JDs from this upload
+                const mappedCandidates = mapApiCandidatesToTable(
+                  ranking.rankings,
+                  areaOfInterestMap
                 );
 
-                const newJD: UIJD = { id, Job_Title, Company, Location, Technology };
-                const mappedCandidates = mapApiCandidatesToTable(ranking.rankings);
+                // Create one UIJD entry per uploaded JD file
+                const newJDs: UIJD[] = jdExtractedList.map(({ extracted }) => {
+                  const id = crypto.randomUUID();
 
-                setJDs((prev) => [newJD, ...prev]);
-                setCandidatesByJd((prev) => ({ ...prev, [id]: mappedCandidates }));
-                setSelectedJdId(id);
+                  const Job_Title = pickField(
+                    extracted as Record<string, unknown>,
+                    ["Job_Title", "JobTitle", "job_title", "title"],
+                    "Untitled JD"
+                  );
+                  const Company = pickField(
+                    extracted as Record<string, unknown>,
+                    ["Company", "company", "organisation", "organization"],
+                    ""
+                  );
+                  const Location = pickField(
+                    extracted as Record<string, unknown>,
+                    ["Location", "location", "city", "country"],
+                    ""
+                  );
+                  const Technology = pickField(
+                    extracted as Record<string, unknown>,
+                    ["Technology", "technologies", "Technical Skills", "Technical_Skills",
+                     "tech_skills", "Required_Skills", "Skills", "skills"],
+                    ""
+                  );
+
+                  return { id, Job_Title, Company, Location, Technology };
+                });
+
+                // Add all new JDs to state
+                setJDs((prev) => [...newJDs, ...prev]);
+
+                // Associate the same ranked candidates with EVERY uploaded JD
+                // (server ranked against all JDs combined — same list per JD)
+                setCandidatesByJd((prev) => {
+                  const next = { ...prev };
+                  for (const jd of newJDs) {
+                    next[jd.id] = mappedCandidates;
+                  }
+                  return next;
+                });
+
+                // Select the first new JD and navigate to dashboard
+                setSelectedJdId(newJDs[0]?.id ?? null);
                 setActiveView("dashboard");
               }}
             />

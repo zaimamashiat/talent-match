@@ -1,6 +1,11 @@
 """
-CV Screening Pipeline - FastAPI Version v2.1
+CV Screening Pipeline - FastAPI Version v2.2
 Run: uvicorn main:app --reload --port 8000 --host 0.0.0.0
+
+Changes in v2.2:
+  - Portfolio skill extraction now uses Groq/LLaMA instead of NER model
+  - Single combined Groq call per portfolio (summary + skills together)
+  - NER model still used for CV text skill extraction only
 """
 
 import os
@@ -124,7 +129,7 @@ ALLOWED_ORIGINS = [
 app = FastAPI(
     title="CV Screening API",
     description="AI-powered CV screening, ranking & portfolio extraction",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 app.add_middleware(
@@ -144,10 +149,9 @@ SBERT_MODEL_PATH = os.getenv(
     "SBERT_MODEL_PATH",
     r"C:\PROJECTS\models\sentence_trasnformers\trained_mpnet_resume"
 )
-# AFTER
 sbert_model = SentenceTransformer(SBERT_MODEL_PATH)
 
-# Detect output dimension so the reducer always projects to 384-dim,
+# Detect output dimension so the reducer always projects to 384-dim
 _sbert_out_dim = sbert_model.get_sentence_embedding_dimension()
 _sbert_reducer = nn.Linear(_sbert_out_dim, 384) if _sbert_out_dim != 384 else nn.Identity()
 _sbert_reducer.eval()
@@ -293,21 +297,57 @@ def _load_local_models():
 
 def run_designation_model(resume_text: str):
     _load_local_models()
-    label_map = {i: cat for i, cat in enumerate(CATEGORIES)}
+
+    # If model not loaded, fall back to BERT category prediction
     if _designation_model is None:
-        return "Unknown", 0.0
+        return _fallback_category(resume_text)
+
     inputs = _designation_tokenizer(
         resume_text, truncation=True, padding=True, max_length=512, return_tensors="pt"
     )
     with torch.no_grad():
         logits = _designation_model(**inputs).logits
-        pred   = torch.argmax(logits, dim=-1).item()
-        score  = torch.softmax(logits, dim=-1)[0, pred].item()
-    
-    # Normalize confidence to 0.3–1.0 range
+        probs  = torch.softmax(logits, dim=-1)[0]
+
+    num_outputs = logits.shape[-1]
+
+    if num_outputs >= len(CATEGORIES):
+        pred  = torch.argmax(probs).item()
+        score = probs[pred].item()
+        label = CATEGORIES[pred % len(CATEGORIES)]
+    else:
+        pred        = torch.argmax(probs).item()
+        score       = probs[pred].item()
+        chunk_size  = max(1, len(CATEGORIES) // num_outputs)
+        start       = pred * chunk_size
+        end         = start + chunk_size if pred < num_outputs - 1 else len(CATEGORIES)
+        label = _pick_best_category(resume_text, CATEGORIES[start:end])
+
     normalized_score = 0.3 + (score * 0.7)
-    
-    return label_map.get(pred, "Unknown"), round(normalized_score, 4)
+    return label, round(normalized_score, 4)
+
+
+def _fallback_category(resume_text: str) -> tuple:
+    """Pick the best CATEGORY using SBERT cosine similarity when no model is available."""
+    label = _pick_best_category(resume_text, CATEGORIES)
+    return label, 0.3
+
+
+def _pick_best_category(resume_text: str, candidates: List[str]) -> str:
+    """
+    Use SBERT embeddings to find which candidate category best matches the resume text.
+    Always returns one of the candidates — never Unknown.
+    """
+    if len(candidates) == 1:
+        return candidates[0]
+    try:
+        text_emb = _sbert_embed(resume_text[:512])
+        cat_embs = torch.stack([_sbert_embed(c) for c in candidates])
+        sims     = util.cos_sim(text_emb.unsqueeze(0), cat_embs)[0]
+        best_idx = torch.argmax(sims).item()
+        return candidates[best_idx]
+    except Exception:
+        return candidates[0]
 
 def run_experience_model(resume_text: str):
     _load_local_models()
@@ -329,11 +369,12 @@ def infer_experience_level_with_model(resume_text: str) -> str:
 
 
 # ──────────────────────────────────────────────
-# NER skill extraction
+# NER skill extraction  (CV text only — NOT used for portfolios)
 # ──────────────────────────────────────────────
 NER_SKILL_LABELS = {"Skills", "Technology", "Designation", "Certifications"}
 
 def ner_extract_skills(text: str, ner_model) -> List[str]:
+    """Extract skills from CV text using NER. Used for CV rows only."""
     if ner_model is None or not text.strip():
         return []
     try:
@@ -349,6 +390,126 @@ def ner_extract_skills(text: str, ner_model) -> List[str]:
     except Exception as e:
         print(f"NER extraction error: {e}")
         return []
+
+
+# ──────────────────────────────────────────────
+# Groq-based portfolio skill extraction  (replaces NER for portfolios)
+# ──────────────────────────────────────────────
+
+def llm_summarize_and_extract_skills(text: str, context: str, groq_client) -> tuple:
+    """
+    Single Groq/LLaMA call that returns both a summary and a skill list.
+    Using one call instead of two saves API quota and reduces latency.
+
+    Returns:
+        summary (str)       : 120-word paragraph about the portfolio
+        skills  (List[str]) : cleaned, normalised list of detected skills
+
+    Returns ("", []) immediately if text is empty or too short to be real content,
+    so Groq is never called with garbage/error strings and never hallucinates.
+    """
+    # Guard: never call Groq if there is nothing real to analyze
+    if not text or len(text.strip()) < 100:
+        return "", []
+
+    prompt = f"""Analyze this {context} portfolio content carefully.
+Return ONLY valid JSON with exactly two fields:
+  "summary": a single paragraph (max 120 words) describing technical skills, notable projects, tools & frameworks, and overall developer profile
+  "skills": a comma-separated string of ONLY genuine technical skills
+
+Rules for "skills":
+- INCLUDE ONLY: programming languages (Python, Java, C++), frameworks/libraries (React, Django, Spring Boot), databases (PostgreSQL, MongoDB), cloud platforms (AWS, GCP, Azure), and DevOps/infrastructure tools (Docker, Kubernetes, Terraform, Jenkins, Git)
+- DO NOT INCLUDE: competitive programming platforms (Leetcode, Codeforces, Atcoder, HackerRank, Codechef), social platforms (Discord, LinkedIn, Twitter, Reddit), code editors or IDEs (VS Code, PyCharm, Sublime, Code-Blocks, IntelliJ), deployment/hosting platforms used passively (Netlify, Vercel, Heroku unless the developer built pipelines with them), soft skills, or any tool the developer only uses as an end user
+- "skills" must be a flat comma-separated string, not an array
+- No markdown, no code fences, no extra keys, no explanations outside the JSON
+- If a field cannot be determined, use an empty string ""
+
+Content ({context}):
+{text[:3000]}"""
+
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_completion_tokens=500,
+        )
+        raw = resp.choices[0].message.content.strip()
+        # Strip accidental markdown fences
+        raw = re.sub(r"```json\n?|```\n?", "", raw).strip()
+        data    = json.loads(raw)
+        summary = data.get("summary", "").strip()
+        skills_raw = data.get("skills", "")
+        skills = _parse_groq_skills(skills_raw)
+        return summary, skills
+
+    except json.JSONDecodeError:
+        # JSON parse failed — try to salvage a summary from raw text
+        print(f"Groq JSON parse failed for {context} portfolio, attempting text fallback")
+        summary = raw[:300] if raw else f"Summary unavailable for {context} portfolio"
+        return summary, []
+
+    except Exception as e:
+        print(f"Groq summarize+extract error ({context}): {e}")
+        return f"Extraction failed: {e}", []
+
+
+# Platforms / tools that are NOT developer skills and should never appear in results
+_SKILL_BLOCKLIST = {
+    # Competitive programming sites
+    "leetcode", "codeforces", "atcoder", "codechef", "hackerrank", "hackerearth",
+    "topcoder", "spoj", "codeabbey",
+    # Social / communication platforms
+    "discord", "slack", "linkedin", "twitter", "reddit", "facebook", "instagram",
+    "telegram", "whatsapp", "skype", "zoom", "teams",
+    # Code editors & IDEs (not skills, just tools)
+    "vs code", "vscode", "visual studio code", "pycharm", "intellij", "webstorm",
+    "sublime", "sublime text", "atom", "notepad++", "code-blocks", "codeblocks",
+    "eclipse", "netbeans", "xcode", "android studio",
+    # Passive hosting / deployment platforms
+    "netlify", "vercel", "heroku", "github pages", "render",
+    # Generic non-skills
+    "github", "git & github", "competitive programming", "problem solving",
+    "open source", "agile", "scrum",
+}
+
+def _parse_groq_skills(skills_raw: str) -> List[str]:
+    """
+    Parse a comma-separated skills string returned by Groq into a clean list.
+    Filters out:
+      - sentence fragments and stopword-heavy tokens
+      - overly long strings (not a skill name)
+      - known noise: IDEs, social platforms, competitive programming sites
+    """
+    if not skills_raw or not isinstance(skills_raw, str):
+        return []
+
+    skills = []
+    for token in skills_raw.split(","):
+        s = normalize_skill(token)
+        if not s:
+            continue
+        # Too long to be a real skill name
+        if len(s) > 40:
+            continue
+        # Looks like a sentence fragment
+        if re.search(
+            r"\b(is|are|was|were|the|and|or|to|in|of|for|with|that|this|here|below|"
+            r"have|has|had|will|would|can|could|should|may|might|must)\b",
+            s
+        ):
+            continue
+        # Hard blocklist — platforms, IDEs, social tools that are NOT skills
+        if s in _SKILL_BLOCKLIST:
+            continue
+        # Partial blocklist match (e.g. "git & github" contains "github")
+        if any(blocked in s for blocked in _SKILL_BLOCKLIST):
+            continue
+        skills.append(s)
+
+    # Deduplicate while preserving order
+    seen: set = set()
+    return [s for s in skills if not (s in seen or seen.add(s))]
 
 
 # ──────────────────────────────────────────────
@@ -374,6 +535,8 @@ class CVRankEntry(BaseModel):
     category_confidence: float
     semantic_match_pct:  float
     tech_match_pct:      float
+    keyword_score:       float = 0.0
+    entity_keyword_hits: Optional[Dict[str, List[str]]] = None
     priority_boost:      float
     total_score:         float
     matched_skills:      List[str]
@@ -384,13 +547,15 @@ class CVRankEntry(BaseModel):
     portfolio_skills:    Optional[List[str]]
 
 class RankedCandidate(BaseModel):
-    rank:               int
-    candidate:          str
-    category:           str
-    tech_match_pct:     float
-    semantic_match_pct: float
-    total_score:        float
-    matched_skills:     List[str]
+    rank:                int
+    candidate:           str
+    category:            str
+    tech_match_pct:      float
+    keyword_score:       float
+    entity_keyword_hits: Optional[Dict[str, List[str]]]
+    semantic_match_pct:  float
+    total_score:         float
+    matched_skills:      List[str]
 
 class RankingResponse(BaseModel):
     jd_title:           Optional[str]
@@ -490,49 +655,16 @@ def fetch_github_readme(username: str, repo: str) -> str:
     except Exception:
         return ""
 
-def llm_summarize(text: str, context: str, groq_client) -> str:
-    prompt = f"""Summarize this {context} portfolio in max 120 words.
-Focus on: technical skills, notable projects, tools & frameworks, overall developer profile.
-Write a single concise paragraph. No bullet points.
 
-Content:
-{text[:2500]}"""
-    try:
-        resp = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0, max_completion_tokens=200,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Summary unavailable: {e}"
+def scrape_portfolio(url: str, groq_client, ner_model=None) -> Dict:
+    """
+    Scrape a portfolio URL.
 
-def llm_extract_skills(text: str, groq_client) -> List[str]:
-    prompt = f"""Extract technical skills ONLY if they are explicitly mentioned word-for-word in the text below.
-Do NOT infer, guess, or add related skills that are not directly written.
-Return ONLY a comma-separated list. No extra text.
-Example output: Python, React, Docker, PostgreSQL
-
-Text:
-{text[:2000]}"""
-    try:
-        resp = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_completion_tokens=150,
-        )
-        raw = resp.choices[0].message.content.strip()
-
-        if "," not in raw:
-            raw = re.sub(r"([a-z])([A-Z])", r"\1,\2", raw)
-            raw = re.sub(r"([A-Z]{2,})([A-Z][a-z])", r"\1,\2", raw)
-
-        return list(dict.fromkeys([s.strip() for s in raw.split(",") if s.strip()]))
-    except Exception:
-        return []
-
-def scrape_portfolio(url: str, groq_client) -> Dict:
+    Summary AND skill extraction both use a single Groq/LLaMA call via
+    llm_summarize_and_extract_skills().  The ner_model parameter is kept
+    for backwards compatibility but is no longer used here — NER is reserved
+    for CV text extraction only.
+    """
     clean = normalize_url(url)
     base  = {
         "url":             clean or url,
@@ -555,38 +687,56 @@ def scrape_portfolio(url: str, groq_client) -> Dict:
             if not username:
                 base["error"] = "Cannot extract GitHub username"
                 return base
-            repos        = fetch_github_repos(username)
+
+            repos         = fetch_github_repos(username)
             base["repos"] = repos
+
             readme_texts = []
             for repo in sorted(repos, key=lambda r: r["stars"], reverse=True)[:3]:
                 txt = fetch_github_readme(username, repo["name"])
                 if txt:
                     readme_texts.append(f"[{repo['name']}]\n{txt}")
                 time.sleep(0.3)
+
             repo_lines = "\n".join(
                 f"{r['name']} ({r['language']}): {r['description']}"
                 for r in repos if r.get("description")
             )
-            combined                = f"GitHub: {username}\n\nRepos:\n{repo_lines}\n\nREADMEs:\n" + "\n\n".join(readme_texts)
-            base["summary"]         = llm_summarize(combined, "GitHub", groq_client)
-            base["skills_detected"] = llm_extract_skills(combined, groq_client)
+            combined = (
+                f"GitHub: {username}\n\nRepos:\n{repo_lines}\n\nREADMEs:\n"
+                + "\n\n".join(readme_texts)
+            )
+            # Single Groq call → summary + skills
+            base["summary"], base["skills_detected"] = llm_summarize_and_extract_skills(
+                combined, "GitHub", groq_client
+            )
 
         elif ptype == "linkedin":
             text = scrape_website_text(clean)
             if text.startswith("ERROR"):
-                base["error"]   = "LinkedIn blocked scraping (expected)"
-                base["summary"] = "LinkedIn profile — scraping blocked by LinkedIn"
+                # Scraping was blocked — return empty fields, never hallucinate
+                base["error"]           = "LinkedIn blocked scraping (expected)"
+                base["summary"]         = ""
+                base["skills_detected"] = []
+            elif len(text.strip()) < 200:
+                # LinkedIn returned something but it's too thin to be real profile content
+                base["error"]           = "LinkedIn returned insufficient content"
+                base["summary"]         = ""
+                base["skills_detected"] = []
             else:
-                base["summary"]         = llm_summarize(text, "LinkedIn", groq_client)
-                base["skills_detected"] = llm_extract_skills(text, groq_client)
+                base["summary"], base["skills_detected"] = llm_summarize_and_extract_skills(
+                    text, "LinkedIn", groq_client
+                )
+
         else:
             text = scrape_website_text(clean)
             if text.startswith("ERROR"):
                 base["error"]   = text
                 base["summary"] = "Could not fetch website"
             else:
-                base["summary"]         = llm_summarize(text, "portfolio website", groq_client)
-                base["skills_detected"] = llm_extract_skills(text, groq_client)
+                base["summary"], base["skills_detected"] = llm_summarize_and_extract_skills(
+                    text, "portfolio website", groq_client
+                )
 
     except Exception as e:
         base["error"]   = str(e)
@@ -850,7 +1000,12 @@ def predict_category(text: str, models):
     with torch.no_grad():
         probs = torch.softmax(bert(**inp).logits, dim=1)
         idx   = torch.argmax(probs, dim=1).item()
-    return (CATEGORIES[idx] if idx < len(CATEGORIES) else "Unknown"), round(probs[0][idx].item(), 4)
+
+    if idx < len(CATEGORIES):
+        return CATEGORIES[idx], round(probs[0][idx].item(), 4)
+
+    label = _pick_best_category(text, CATEGORIES)
+    return label, round(probs[0][idx].item(), 4)
 
 def extract_jd_json(text: str, groq_client) -> dict:
     prompt = f"""Extract from this Job Description, return ONLY valid JSON with fields:
@@ -912,6 +1067,7 @@ async def extract_portfolio_endpoint(url: str = Form(...)):
     cleaned = normalize_url(url)
     if not cleaned:
         raise HTTPException(400, "Invalid or empty URL")
+    # ner_model no longer used inside scrape_portfolio for skill extraction
     return scrape_portfolio(cleaned, models["groq"])
 
 @app.post("/rank-cvs", response_model=RankingResponse)
@@ -1017,45 +1173,55 @@ async def rank_cvs(
         if not cv_texts:
             raise HTTPException(422, "No CV records found in CSV")
 
-        # ── 3. Optional portfolio scraping ────────────────────────────────
+        # ── 3. Optional portfolio scraping (Groq handles summary + skills) ──
         port_cache: Dict[str, Dict] = {}
         if extract_portfolios and portfolio_col:
             unique = list({u for u in cv_port_urls if u})
             print(f"Scraping {len(unique)} unique portfolio URLs…")
             for u in unique:
                 print(f"  → {u}")
+                # Groq now handles both summary and skill extraction inside scrape_portfolio
                 port_cache[u] = scrape_portfolio(u, models["groq"])
                 time.sleep(2)
 
-        # ── 4. Semantic embeddings (all-mpnet-base-v2 → 384-dim) ──────────
+        # ── 4. JD keyword tokenization (from query scorer) ────────────────
+        jd_keyword_tokens = tokenize_query(" ".join(jd_skills) + " " + jd_text)
+        jd_word_freq      = FreqDist(jd_keyword_tokens)
+
+        # ── 5. Semantic embeddings (all-mpnet-base-v2 → 384-dim) ──────────
         def embed(text):
-            return _sbert_embed(text[:512])   # (384,)
+            return _sbert_embed(text[:512])
 
-        jd_emb          = embed(jd_text)
-        cv_embs         = torch.stack([embed(t) for t in cv_texts])
-        semantic_scores = [
-            round(util.cos_sim(jd_emb.unsqueeze(0), e.unsqueeze(0)).item() * 100, 2)
-            for e in cv_embs
-        ]
+        jd_emb  = embed(jd_text)
+        cv_embs = torch.stack([embed(t) for t in cv_texts])
 
-        # ── 5. Category prediction ─────────────────────────────────────────
+        # ── 6. Category prediction ─────────────────────────────────────────
         cat_results = [predict_category(t[:512], models) for t in cv_texts]
 
-        # ── 5b. NER skill extraction ───────────────────────────────────────
+        # ── 6b. NER skill extraction from CV text (NER still used here) ───
         ner_skills_list: List[List[str]] = []
         if models.get("ner"):
-            print("Extracting skills via NER model...")
+            print("Extracting CV skills via NER model...")
             for t in cv_texts:
                 ner_skills_list.append(ner_extract_skills(t, models["ner"]))
         else:
             ner_skills_list = [[] for _ in cv_texts]
 
-        # ── 6. Build candidate rows ────────────────────────────────────────
+        # Entity columns to score keyword hits against
+        RANK_ENTITY_COLS   = [
+            "Skills", "Designation", "Companies", "Education", "CollegeName",
+            "Experience", "Certifications", "Technology", "Links", "Projects", "Rewards"
+        ]
+        RANK_IDENTITY_COLS = ["Name", "Address", "Location", "Email", "Phone"]
+
+        # ── 7. Build candidate rows ────────────────────────────────────────
         rows = []
         for i, cid in enumerate(cv_ids):
             port_url  = cv_port_urls[i]
             port_data = port_cache.get(port_url, {}) if port_url else {}
+            meta      = cv_meta_rows[i]
 
+            # ── Merge skills: CSV column + NER (CV text) + Groq (portfolio) ──
             augmented = list(cv_skills_list[i])
             if port_data.get("skills_detected"):
                 augmented = list(set(augmented + [
@@ -1064,12 +1230,43 @@ async def rank_cvs(
             if ner_skills_list[i]:
                 augmented = list(set(augmented + ner_skills_list[i]))
 
+            # ── Tech match (fuzzy skill overlap) ──────────────────────────
             tech_pct, matched, missing = fuzzy_skill_match(augmented, jd_skills)
-            sem_pct        = semantic_scores[i]
-            meta           = cv_meta_rows[i]
-            priority_boost = compute_priority_boost(meta, matched)
-            total_score    = round(sem_w * sem_pct + tec_w * tech_pct + priority_boost, 2)
 
+            # ── Semantic similarity ────────────────────────────────────────
+            sem_pct = round(
+                util.cos_sim(jd_emb.unsqueeze(0), cv_embs[i].unsqueeze(0)).item() * 100, 2
+            )
+
+            # ── Entity-column keyword score ───────────────────────────────
+            combined_entity_text = " ".join(
+                str(meta.get(col, "")).lower()
+                for col in RANK_ENTITY_COLS
+                if str(meta.get(col, "")).strip()
+            )
+
+            entity_keyword_hits: Dict[str, List[str]] = {}
+            for col in RANK_ENTITY_COLS:
+                val  = str(meta.get(col, "")).lower()
+                hits = [kw for kw in jd_keyword_tokens if kw in val]
+                if hits:
+                    entity_keyword_hits[col] = hits
+
+            matched_tokens  = set(jd_keyword_tokens) & set(combined_entity_text.split())
+            weighted_hits   = sum(jd_word_freq[t] for t in matched_tokens)
+            total_jd_weight = sum(jd_word_freq[t] for t in jd_keyword_tokens) or 1
+            keyword_score   = round(weighted_hits / total_jd_weight * 100, 2)
+
+            # ── Priority boost from resume metadata ───────────────────────
+            priority_boost = compute_priority_boost(meta, matched)
+
+            # ── Final score ────────────────────────────────────────────────
+            blended_tech = round(0.6 * tech_pct + 0.4 * keyword_score, 2)
+            total_score  = round(
+                sem_w * sem_pct + tec_w * blended_tech + priority_boost, 2
+            )
+
+            # ── Identity fields ────────────────────────────────────────────
             candidate_name = next(
                 (str(meta[c]).strip() for c in NAME_COL_CANDIDATES
                  if c in meta and str(meta[c]).strip()), ""
@@ -1083,10 +1280,10 @@ async def rank_cvs(
                  if c in meta and str(meta[c]).strip()), ""
             )
 
-            # Policy-guided role & experience inference
+            # ── Policy-guided role & experience inference ──────────────────
             designation_text = str(meta.get("Designation", meta.get("designation", "")))
-            skills_text      = str(meta.get("Skills", meta.get("skills", "")))
-            experience_text  = str(meta.get("Experience", meta.get("experience", "")))
+            skills_text      = str(meta.get("Skills",      meta.get("skills", "")))
+            experience_text  = str(meta.get("Experience",  meta.get("experience", "")))
 
             policy_output = policy_guided_resume_analysis(
                 designation_text, skills_text, experience_text,
@@ -1105,6 +1302,8 @@ async def rank_cvs(
                 "category_confidence": cat_results[i][1],
                 "semantic_match_pct":  sem_pct,
                 "tech_match_pct":      tech_pct,
+                "keyword_score":       keyword_score,
+                "entity_keyword_hits": entity_keyword_hits,
                 "priority_boost":      priority_boost,
                 "total_score":         total_score,
                 "matched_skills":      matched,
@@ -1115,23 +1314,25 @@ async def rank_cvs(
                 "portfolio_skills":    port_data.get("skills_detected") or None,
             })
 
-        # ── 7. Sort & assign ranks ─────────────────────────────────────────
+        # ── 8. Sort & assign ranks ─────────────────────────────────────────
         rows.sort(key=lambda x: x["total_score"], reverse=True)
         for rank, row in enumerate(rows, 1):
             row["rank"] = rank
 
-        # ── 8. Build slim ranked_table ─────────────────────────────────────
+        # ── 9. Build slim ranked_table ─────────────────────────────────────
         ranked_table = []
         for row in rows:
             display_name = row["candidate_name"] or row["candidate_email"] or row["candidate_id"]
             ranked_table.append({
-                "rank":               row["rank"],
-                "candidate":          display_name,
-                "category":           row["category"],
-                "tech_match_pct":     row["tech_match_pct"],
-                "semantic_match_pct": row["semantic_match_pct"],
-                "total_score":        row["total_score"],
-                "matched_skills":     row["matched_skills"],
+                "rank":                row["rank"],
+                "candidate":           display_name,
+                "category":            row["category"],
+                "tech_match_pct":      row["tech_match_pct"],
+                "keyword_score":       row["keyword_score"],
+                "entity_keyword_hits": row["entity_keyword_hits"],
+                "semantic_match_pct":  row["semantic_match_pct"],
+                "total_score":         row["total_score"],
+                "matched_skills":      row["matched_skills"],
             })
 
         return {
@@ -1170,3 +1371,198 @@ def skill_match_endpoint(
 @app.get("/categories")
 def get_categories():
     return {"categories": CATEGORIES}
+
+
+# ══════════════════════════════════════════════
+# QUERY-BASED SEARCH SCORER
+# ══════════════════════════════════════════════
+
+SCORING_ENTITY_COLUMNS = [
+    "Skills", "Designation", "Companies", "Education", "CollegeName",
+    "Experience", "Certifications", "Technology", "Links", "Projects", "Rewards"
+]
+IDENTITY_COLUMNS = ["Name", "Address", "Location", "Email", "Phone"]
+
+QUERY_STOPWORDS = {
+    "i", "me", "my", "we", "our", "you", "your", "he", "she", "they", "it",
+    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "shall", "should", "may", "might",
+    "can", "could", "a", "an", "the", "and", "but", "or", "so", "if", "in",
+    "on", "at", "to", "for", "of", "with", "by", "from", "as", "into",
+    "about", "who", "what", "which", "that", "this", "these", "those",
+    "find", "me", "show", "get", "list", "give", "all", "any", "some",
+}
+
+
+def tokenize_query(query: str) -> List[str]:
+    """Tokenize a free-text query into meaningful keywords, removing stopwords."""
+    tokens = re.findall(r"[a-zA-Z0-9#+.\-]+", query.lower())
+    return [t for t in tokens if t not in QUERY_STOPWORDS and len(t) > 1]
+
+
+def query_score_dataframe(
+    df: pd.DataFrame,
+    query_text: str,
+) -> tuple:
+    """
+    Score all rows in df against a free-text query using:
+      - SBERT semantic similarity (80%)
+      - Keyword overlap score     (20%)
+      - Identity field exact match (forces inclusion at score 0)
+      - Policy-guided role + experience inference per candidate
+
+    Returns:
+        results          : List[Dict] sorted by similarity_score desc
+        query_tokens     : List[str]  tokenized query keywords
+        word_freq        : FreqDist of query tokens
+        keyword_clusters : Dict mapping matched-term-tuples -> [resume_file_name]
+    """
+    query_tokens    = tokenize_query(query_text)
+    query_embedding = sbert_model.encode(query_text, convert_to_tensor=True)
+    word_freq       = FreqDist(query_tokens)
+
+    results          = []
+    keyword_clusters = {}
+
+    for _, row in df.iterrows():
+        resume_file = str(row.get("resume_file_name", row.name)).strip()
+
+        # ── Identity exact match ───────────────────────────────────────
+        matched_identity = any(
+            query_text.lower() in str(row.get(col, "")).lower()
+            for col in IDENTITY_COLUMNS
+        )
+
+        # ── Build combined scoring text from entity columns ───────────
+        combined_entity_text = " ".join(
+            str(row.get(col, "")).lower()
+            for col in SCORING_ENTITY_COLUMNS
+            if str(row.get(col, "")).strip()
+        )
+
+        # ── Keyword match per entity column ───────────────────────────
+        matched_keywords: Dict[str, List[str]] = {}
+        for col in SCORING_ENTITY_COLUMNS:
+            val = str(row.get(col, "")).lower()
+            if not val.strip():
+                continue
+            hits = [kw for kw in query_tokens if kw in val]
+            if hits:
+                matched_keywords[col] = hits
+
+        if not matched_keywords and not matched_identity:
+            continue  # skip candidates with zero relevance
+
+        # ── Scoring ───────────────────────────────────────────────────
+        if matched_keywords and combined_entity_text.strip():
+            resume_embedding = sbert_model.encode(combined_entity_text, convert_to_tensor=True)
+            sim_score        = util.cos_sim(query_embedding, resume_embedding).item() * 100
+            keyword_score    = round(
+                len(set(query_tokens) & set(combined_entity_text.split()))
+                / max(1, len(query_tokens)) * 100,
+                2,
+            )
+            final_score = round(0.8 * sim_score + 0.2 * keyword_score, 2)
+        else:
+            # Identity-only match — include but score 0
+            final_score   = 0.0
+            sim_score     = 0.0
+            keyword_score = 0.0
+
+        # ── Policy-guided role + experience inference ──────────────────
+        designation_text = str(row.get("Designation", ""))
+        skills_text      = str(row.get("Skills", ""))
+        experience_text  = str(row.get("Experience", ""))
+
+        policy_output    = policy_guided_resume_analysis(
+            designation_text, skills_text, experience_text,
+            combined_entity_text, training_mode=False,
+        )
+        primary_role     = policy_output["pred_label"]
+        experience_level = infer_experience_level_with_model(combined_entity_text)
+
+        # ── Build entity snapshot for response ────────────────────────
+        entity_dict = {
+            col: str(row.get(col, ""))
+            for col in SCORING_ENTITY_COLUMNS + IDENTITY_COLUMNS
+            if str(row.get(col, "")).strip()
+        }
+
+        results.append({
+            "resume_file_name": resume_file,
+            "similarity_score": final_score,
+            "semantic_score":   round(sim_score, 2),
+            "keyword_score":    keyword_score,
+            "matched_keywords": matched_keywords,
+            "matched_identity": matched_identity,
+            "inferred_role":    primary_role,
+            "experience_level": experience_level,
+            "entities":         entity_dict,
+        })
+
+        # ── Cluster by matched terms ───────────────────────────────────
+        matched_terms = tuple(
+            sorted({t for terms in matched_keywords.values() for t in terms})
+        ) or ("matched_identity",)
+        keyword_clusters.setdefault(matched_terms, []).append(resume_file)
+
+    results.sort(key=lambda x: (x["similarity_score"], x["matched_identity"]), reverse=True)
+    return results, query_tokens, word_freq, keyword_clusters
+
+
+# ── Pydantic schema ────────────────────────────────────────────────────────────
+
+class SearchCVsResponse(BaseModel):
+    query:            str
+    query_tokens:     List[str]
+    total_matched:    int
+    keyword_clusters: Dict[str, List[str]]
+    results:          List[Dict[str, Any]]
+
+
+# ── /search-cvs endpoint ───────────────────────────────────────────────────────
+
+@app.post("/search-cvs", response_model=SearchCVsResponse)
+async def search_cvs(
+    cv_file: UploadFile = File(...),
+    query:   str        = Form(...),
+):
+    """
+    Free-text search over a CSV of resumes.
+
+    POST fields:
+      - cv_file : CSV file (same format as /rank-cvs)
+      - query   : plain English e.g. "senior python developer with AWS experience"
+
+    Returns candidates ranked by semantic + keyword relevance to the query.
+    Each result includes inferred role, experience level, and which fields matched.
+    """
+    if not query.strip():
+        raise HTTPException(400, "Query cannot be empty")
+
+    get_models()  # ensure models loaded for policy + experience inference
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+        tmp.write(await cv_file.read())
+        csv_path = tmp.name
+
+    try:
+        df = pd.read_csv(csv_path).fillna("")
+    finally:
+        os.unlink(csv_path)
+
+    if df.empty:
+        raise HTTPException(422, "CSV is empty or could not be parsed")
+
+    results, query_tokens, _, keyword_clusters = query_score_dataframe(df, query)
+
+    # Serialise keyword_clusters — tuple keys → comma-joined strings for JSON
+    serialised_clusters = {", ".join(k): v for k, v in keyword_clusters.items()}
+
+    return {
+        "query":            query,
+        "query_tokens":     query_tokens,
+        "total_matched":    len(results),
+        "keyword_clusters": serialised_clusters,
+        "results":          results,
+    }

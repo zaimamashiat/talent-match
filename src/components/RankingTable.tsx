@@ -16,6 +16,7 @@ export interface ApiCandidate {
   cv_text:              string | null;
   raw_row:              Record<string, string> | null;
   category:             string;
+  area_of_interest:     string | null; // ← ADD
   category_confidence:  number;
   semantic_match_pct:   number;
   tech_match_pct:       number;
@@ -36,7 +37,7 @@ type SortKey = "rank" | "tech_match_pct" | "semantic_match_pct";
 interface RankingTableProps {
   candidates: ApiCandidate[];
   jdTitle:    string;
-  onDelete?:  (candidateId: string) => void; // optional external handler
+  onDelete?:  (candidateId: string) => void;
 }
 
 export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProps) {
@@ -52,28 +53,50 @@ export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProp
    * candidate_name → name alias → raw_row Name fields → email local-part → candidate_id
    */
   const displayName = (c: ApiCandidate) => {
-    // 1. Explicit name field
     if (c.candidate_name?.trim()) return c.candidate_name.trim();
-    // 2. Convenience alias set by mapApiCandidatesToTable
     if (c.name?.trim() && c.name.trim() !== (c.candidate_email ?? "").trim()) return c.name.trim();
-    // 3. Try raw_row for common name columns
     if (c.raw_row) {
-      const nameKeys = ["Name", "name", "Full Name", "full_name", "FullName", "candidate_name"];
+      const nameKeys = ["Full Name ", "Full Name", "Name", "name", "full_name", "FullName", "candidate_name"];
       for (const k of nameKeys) {
         const v = c.raw_row[k]?.trim();
         if (v) return v;
       }
     }
-    // 4. Email local-part (before @) as readable fallback
     if (c.candidate_email?.trim()) {
       const local = c.candidate_email.split("@")[0];
-      // Humanise: replace dots/underscores/dashes with spaces, title-case
       return local
         .replace(/[._-]/g, " ")
         .replace(/\b\w/g, (ch) => ch.toUpperCase());
     }
-    // 5. Last resort
     return c.candidate_id;
+  };
+
+  /**
+   * Resolve area_of_interest:
+   * 1. area_of_interest field (set by backend _get_field → FIELD_MAP["interest"])
+   * 2. raw_row fallback for common column name variants
+   */
+  const displayAreaOfInterest = (c: ApiCandidate): string | null => {
+    if (c.area_of_interest?.trim()) return c.area_of_interest.trim();
+    if (c.raw_row) {
+      const aoiKeys = [
+        "Area of Interest ",   // Google Form column (trailing space)
+        "Area of Interest",
+        "area_of_interest",
+        "AreaOfInterest",
+        "Interest",
+        "interest",
+        "Domain",
+        "domain",
+        "Field",
+        "field",
+      ];
+      for (const k of aoiKeys) {
+        const v = c.raw_row[k]?.trim();
+        if (v && v.toLowerCase() !== "nan" && v !== "-") return v;
+      }
+    }
+    return null;
   };
 
   const initials = (c: ApiCandidate) => {
@@ -94,7 +117,8 @@ export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProp
       return (
         displayName(c).toLowerCase().includes(q) ||
         (c.category?.toLowerCase() ?? "").includes(q) ||
-        (c.candidate_email?.toLowerCase() ?? "").includes(q)
+        (c.candidate_email?.toLowerCase() ?? "").includes(q) ||
+        (displayAreaOfInterest(c)?.toLowerCase() ?? "").includes(q)
       );
     })
     .sort((a, b) => {
@@ -131,7 +155,7 @@ export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProp
         <div className="flex items-center gap-3">
           <input
             type="text"
-            placeholder="Filter by name, email, or category..."
+            placeholder="Filter by name, email, category, or area of interest..."
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             className="flex-1 max-w-xs px-3 py-2 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-ring"
@@ -152,8 +176,15 @@ export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProp
                       Rank <SortIcon col="rank" />
                     </button>
                   </th>
-                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">Candidate</th>
-                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">Category</th>
+                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">
+                    Candidate
+                  </th>
+                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">
+                    Category
+                  </th>
+                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">
+                    Area of Interest
+                  </th>
                   <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">
                     <button className="flex items-center gap-1" onClick={() => toggleSort("tech_match_pct")}>
                       Tech Match <SortIcon col="tech_match_pct" />
@@ -164,7 +195,9 @@ export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProp
                       Semantic <SortIcon col="semantic_match_pct" />
                     </button>
                   </th>
-                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">Matched Skills</th>
+                  <th className="text-left px-4 py-3 font-semibold text-muted-foreground text-xs uppercase tracking-wide">
+                    Matched Skills
+                  </th>
                   <th className="px-4 py-3 w-28" />
                 </tr>
               </thead>
@@ -182,8 +215,8 @@ export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProp
                     <td className="px-4 py-3">
                       <div className={cn(
                         "w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold",
-                        c.rank === 1 ? "bg-amber-400 text-amber-900" :
-                        c.rank === 2 ? "bg-slate-200 text-slate-700"  :
+                        c.rank === 1 ? "bg-amber-400 text-amber-900"   :
+                        c.rank === 2 ? "bg-slate-200 text-slate-700"   :
                         c.rank === 3 ? "bg-orange-200 text-orange-800" :
                         "bg-muted text-muted-foreground"
                       )}>
@@ -198,8 +231,12 @@ export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProp
                           {initials(c)}
                         </div>
                         <div className="min-w-0">
-                          <p className="font-medium text-foreground truncate max-w-[160px]">{displayName(c)}</p>
-                          <p className="text-xs text-muted-foreground truncate max-w-[160px]">{c.candidate_email || c.candidate_id}</p>
+                          <p className="font-medium text-foreground truncate max-w-[160px]">
+                            {displayName(c)}
+                          </p>
+                          <p className="text-xs text-muted-foreground truncate max-w-[160px]">
+                            {c.candidate_email || c.candidate_id}
+                          </p>
                         </div>
                       </div>
                     </td>
@@ -211,11 +248,26 @@ export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProp
                       </Badge>
                     </td>
 
+                    {/* Area of Interest */}
+                    <td className="px-4 py-3">
+                      {displayAreaOfInterest(c) ? (
+                        <Badge variant="outline" className="text-xs font-medium whitespace-nowrap max-w-[140px] truncate block">
+                          {displayAreaOfInterest(c)}
+                        </Badge>
+                      ) : (
+                        <span className="text-[11px] text-muted-foreground">—</span>
+                      )}
+                    </td>
+
                     {/* Tech match */}
-                    <td className="px-4 py-3"><ScoreBadge score={c.tech_match_pct} showBar /></td>
+                    <td className="px-4 py-3">
+                      <ScoreBadge score={c.tech_match_pct} showBar />
+                    </td>
 
                     {/* Semantic match */}
-                    <td className="px-4 py-3"><ScoreBadge score={c.semantic_match_pct} showBar /></td>
+                    <td className="px-4 py-3">
+                      <ScoreBadge score={c.semantic_match_pct} showBar />
+                    </td>
 
                     {/* Matched skills */}
                     <td className="px-4 py-3">
@@ -234,10 +286,9 @@ export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProp
                       </div>
                     </td>
 
-                    {/* Actions: View + Delete */}
+                    {/* Actions */}
                     <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                       <div className="flex items-center gap-2">
-                        {/* View */}
                         <button
                           className="flex items-center gap-1 text-xs text-teal font-medium"
                           onClick={(e) => { e.stopPropagation(); setSelected(c); }}
@@ -245,7 +296,6 @@ export function RankingTable({ candidates, jdTitle, onDelete }: RankingTableProp
                           <Eye className="w-3.5 h-3.5" /> View
                         </button>
 
-                        {/* Delete with inline confirmation */}
                         {confirmId === c.candidate_id ? (
                           <div className="flex items-center gap-1">
                             <button

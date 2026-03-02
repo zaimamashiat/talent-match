@@ -4,61 +4,125 @@ import { rankCVs, extractJD } from "@/lib/api";
 import type { ApiRankingResponse } from "@/lib/types";
 import {
   FileText, FileSpreadsheet, Globe,
-  Loader2, AlertCircle, CheckCircle2,
+  Loader2, AlertCircle, CheckCircle2, Plus, X,
 } from "lucide-react";
 
 type Props = {
   onSubmit: (payload: {
-    jdFile:            File;
-    cvFile:            File;
-    extractPortfolios: boolean;
-    jdExtracted:       Record<string, any>;
-    ranking:           ApiRankingResponse;
+    jdFiles:             File[];
+    cvFile:              File;
+    extractPortfolios:   boolean;
+    jdExtractedList:     Array<{ file: File; extracted: Record<string, any> }>;
+    ranking:             ApiRankingResponse;
+    areaOfInterestMap:   Record<string, string>;
   }) => void;
   onCancel?: () => void;
 };
 
-// ── Stage definitions ────────────────────────────────────────────────────────
-interface StageConfig {
-  key:       string;
-  label:     string;
-  sublabel:  string;
-  // Approximate % of total time this stage occupies (used to pace the bar)
-  weight:    number;
+// ── CSV Area-of-Interest parser ──────────────────────────────────────────────
+async function parseAreaOfInterestFromCSV(file: File): Promise<Record<string, string>> {
+  const text = await file.text();
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) return {};
+
+  const parseLine = (line: string): string[] => {
+    const result: string[] = [];
+    let current = "";
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+        else inQuotes = !inQuotes;
+      } else if (ch === "," && !inQuotes) {
+        result.push(current.trim());
+        current = "";
+      } else {
+        current += ch;
+      }
+    }
+    result.push(current.trim());
+    return result;
+  };
+
+  const headers = parseLine(lines[0]).map((h) => h.replace(/^"|"$/g, "").trim());
+
+  const AOI_ALIASES = [
+    "area of interest", "area_of_interest", "areaofinterest",
+    "interest", "domain", "field", "specialization", "focus area",
+  ];
+  const ID_ALIASES = [
+    "email", "candidate_email", "e-mail",
+    "id", "candidate_id", "candidate id",
+    "name", "candidate_name", "full name",
+  ];
+
+  const aoiIdx = headers.findIndex((h) => AOI_ALIASES.includes(h.toLowerCase()));
+  const idIdx  = headers.findIndex((h) => ID_ALIASES.includes(h.toLowerCase()));
+
+  if (aoiIdx === -1) return {};
+
+  const map: Record<string, string> = {};
+  for (let i = 1; i < lines.length; i++) {
+    const cols = parseLine(lines[i]).map((c) => c.replace(/^"|"$/g, "").trim());
+    const aoi  = cols[aoiIdx] ?? "";
+    if (!aoi) continue;
+    const key = idIdx !== -1 ? (cols[idIdx] ?? String(i)) : String(i);
+    if (key) map[key] = aoi;
+  }
+  return map;
 }
 
-const STAGES_NO_PORTFOLIO: StageConfig[] = [
-  { key: "extracting-jd", label: "Extracting job description",    sublabel: "Parsing PDF with LLaMA...",           weight: 20 },
-  { key: "ranking",       label: "Embedding & ranking candidates", sublabel: "BERT + SBERT + fuzzy matching...",    weight: 80 },
-];
+// ── Stage definitions ────────────────────────────────────────────────────────
+interface StageConfig {
+  key:      string;
+  label:    string;
+  sublabel: string;
+  weight:   number;
+}
 
-const STAGES_WITH_PORTFOLIO: StageConfig[] = [
-  { key: "extracting-jd",       label: "Extracting job description",    sublabel: "Parsing PDF with LLaMA...",                    weight: 8  },
-  { key: "ranking",             label: "Embedding & ranking candidates", sublabel: "BERT + SBERT + fuzzy matching...",             weight: 12 },
-  { key: "scraping-portfolios", label: "Scraping portfolios",           sublabel: "GitHub · LinkedIn · websites via LLaMA...",    weight: 80 },
-];
+const buildStages = (jdCount: number, withPortfolio: boolean): StageConfig[] => {
+  const base: StageConfig[] = [
+    {
+      key:      "extracting-jd",
+      label:    jdCount > 1 ? `Extracting ${jdCount} job descriptions` : "Extracting job description",
+      sublabel: "Parsing PDFs with LLaMA...",
+      weight:   withPortfolio ? 8 : 20,
+    },
+    {
+      key:      "ranking",
+      label:    "Embedding & ranking candidates",
+      sublabel: jdCount > 1
+        ? `BERT + SBERT across ${jdCount} JDs — sorting by best match...`
+        : "BERT + SBERT + fuzzy matching...",
+      weight: withPortfolio ? 12 : 80,
+    },
+  ];
+  if (withPortfolio) {
+    base.push({
+      key:      "scraping-portfolios",
+      label:    "Scraping portfolios",
+      sublabel: "GitHub · LinkedIn · websites via LLaMA...",
+      weight:   80,
+    });
+  }
+  return base;
+};
 
 // ── Animated progress hook ───────────────────────────────────────────────────
-/**
- * Drives a progress bar that:
- *  - Advances smoothly within each stage (never hits 100 until done)
- *  - Snaps to the start of the next stage when stageIndex increases
- *  - Jumps to 100 when done=true
- */
 function useAnimatedProgress(
   stageIndex: number,
   stages: StageConfig[],
   done: boolean,
   running: boolean,
+  withPortfolio: boolean,
 ) {
   const [progress, setProgress] = useState(0);
-  const rafRef = useRef<number>(0);
+  const rafRef  = useRef<number>(0);
   const startRef = useRef<number>(0);
-  const stageStartPctRef = useRef<number>(0);
 
-  // Compute cumulative % at the start of each stage
-  const totalWeight = stages.reduce((s, st) => s + st.weight, 0);
-  const stagePcts = stages.map((_, i) =>
+  const totalWeight  = stages.reduce((s, st) => s + st.weight, 0);
+  const stagePcts    = stages.map((_, i) =>
     stages.slice(0, i).reduce((s, st) => s + st.weight, 0) / totalWeight * 100
   );
   const stageEndPcts = stages.map((_, i) =>
@@ -66,29 +130,24 @@ function useAnimatedProgress(
   );
 
   useEffect(() => {
-    if (done) { setProgress(100); return; }
-    if (!running) { setProgress(0); return; }
+    if (done)     { setProgress(100); return; }
+    if (!running) { setProgress(0);   return; }
 
-    const stageStart = stagePcts[stageIndex]  ?? 0;
+    const stageStart = stagePcts[stageIndex]    ?? 0;
     const stageEnd   = stageEndPcts[stageIndex] ?? 100;
-    // Leave a 3% buffer so it never reaches the next stage prematurely
     const stageMax   = stageEnd - 3;
 
-    stageStartPctRef.current = stageStart;
     startRef.current = performance.now();
 
-    // Each stage animates over an estimated duration
-    const STAGE_DURATIONS_MS = running
-      ? stages.map((st) => (st.weight / 100) * (stages === STAGES_WITH_PORTFOLIO ? 180_000 : 30_000))
-      : stages.map(() => 1000);
-    const duration = STAGE_DURATIONS_MS[stageIndex] ?? 10_000;
+    const BASE_DURATION = withPortfolio ? 180_000 : 30_000;
+    const stageWeight = stages[stageIndex]?.weight ?? 100;
+    const duration = (stageWeight / 100) * BASE_DURATION;
 
     const animate = (now: number) => {
       const elapsed = now - startRef.current;
-      const t = Math.min(elapsed / duration, 1);
-      // Ease-out: fast start, slow finish — feels natural for variable server time
-      const eased = 1 - Math.pow(1 - t, 2);
-      const pct = stageStart + eased * (stageMax - stageStart);
+      const t       = Math.min(elapsed / duration, 1);
+      const eased   = 1 - Math.pow(1 - t, 2);
+      const pct     = stageStart + eased * (stageMax - stageStart);
       setProgress(Math.min(pct, stageMax));
       if (t < 1) rafRef.current = requestAnimationFrame(animate);
     };
@@ -102,48 +161,79 @@ function useAnimatedProgress(
 
 // ── Component ────────────────────────────────────────────────────────────────
 export function UploadView({ onSubmit, onCancel }: Props) {
-  const [jdFile, setJdFile]                       = useState<File | null>(null);
+  const [jdFiles, setJdFiles]                     = useState<File[]>([]);
   const [cvFile, setCvFile]                       = useState<File | null>(null);
   const [extractPortfolios, setExtractPortfolios] = useState(false);
   const [stageIndex, setStageIndex]               = useState(0);
   const [isDone, setIsDone]                       = useState(false);
   const [candidateCount, setCandidateCount]       = useState<number | null>(null);
+  const [aoiDetected, setAoiDetected]             = useState<boolean | null>(null);
 
-  const stages = extractPortfolios ? STAGES_WITH_PORTFOLIO : STAGES_NO_PORTFOLIO;
-  const progress = useAnimatedProgress(stageIndex, stages, isDone, false /* updated below */);
-
-  // Track whether mutation is running to feed into the hook
+  const stages       = buildStages(jdFiles.length || 1, extractPortfolios);
   const [isRunning, setIsRunning] = useState(false);
-  const progressLive = useAnimatedProgress(stageIndex, stages, isDone, isRunning);
+  const progressLive = useAnimatedProgress(stageIndex, stages, isDone, isRunning, extractPortfolios);
+
+  useEffect(() => {
+    if (!cvFile) { setAoiDetected(null); return; }
+    parseAreaOfInterestFromCSV(cvFile).then((map) => {
+      setAoiDetected(Object.keys(map).length > 0);
+    });
+  }, [cvFile]);
+
+  const addJdFiles = (incoming: FileList | null) => {
+    if (!incoming) return;
+    const pdfs = Array.from(incoming).filter((f) => f.type === "application/pdf");
+    setJdFiles((prev) => {
+      const names = new Set(prev.map((f) => f.name));
+      return [...prev, ...pdfs.filter((f) => !names.has(f.name))];
+    });
+  };
+
+  const removeJd = (index: number) =>
+    setJdFiles((prev) => prev.filter((_, i) => i !== index));
 
   const mutation = useMutation({
     mutationFn: async () => {
-      if (!jdFile) throw new Error("Please select a JD PDF");
-      if (!cvFile) throw new Error("Please select a CV CSV");
+      if (jdFiles.length === 0) throw new Error("Please select at least one JD PDF");
+      if (!cvFile)              throw new Error("Please select a CV CSV");
 
       setIsRunning(true);
       setIsDone(false);
       setStageIndex(0);
       setCandidateCount(null);
 
-      // Step 1 — extract JD
-      const jdResp    = await extractJD(jdFile);
-      const extracted = jdResp?.extracted ?? {};
+      const areaOfInterestMap = await parseAreaOfInterestFromCSV(cvFile);
 
-      // Step 2 — rank (+ optional portfolio scraping happens server-side)
-      setStageIndex(extractPortfolios ? 1 : 1);
-      if (extractPortfolios) setStageIndex(2); // jump to scraping stage label
+      // Extract all JDs in parallel
+      const jdResults = await Promise.all(
+        jdFiles.map(async (file) => {
+          const resp = await extractJD(file);
+          return { file, extracted: resp?.extracted ?? {} };
+        })
+      );
 
-      const ranking = await rankCVs({ jdFile, cvFile, extractPortfolios });
+      // Rank — pass all JDs; server merges/sorts by best match across JDs
+      setStageIndex(1);
+      if (extractPortfolios) setStageIndex(2);
+
+      // Pass the first JD file (API expects single jdFile)
+      const ranking = await rankCVsMulti({ jdFiles, cvFile, extractPortfolios });
       setCandidateCount(ranking.total_candidates);
 
       setIsDone(true);
       setIsRunning(false);
-      return { extracted, ranking };
+      return { jdExtractedList: jdResults, ranking, areaOfInterestMap };
     },
-    onSuccess: ({ extracted, ranking }) => {
-      if (!jdFile || !cvFile) return;
-      onSubmit({ jdFile, cvFile, extractPortfolios, jdExtracted: extracted, ranking });
+    onSuccess: ({ jdExtractedList, ranking, areaOfInterestMap }) => {
+      if (!cvFile) return;
+      onSubmit({
+        jdFiles,
+        cvFile,
+        extractPortfolios,
+        jdExtractedList,
+        ranking,
+        areaOfInterestMap,
+      });
     },
     onError: () => {
       setIsRunning(false);
@@ -152,11 +242,10 @@ export function UploadView({ onSubmit, onCancel }: Props) {
     },
   });
 
-  const isPending      = mutation.isPending;
-  const currentStage   = stages[Math.min(stageIndex, stages.length - 1)];
-  const pct            = Math.round(progressLive);
+  const isPending    = mutation.isPending;
+  const currentStage = stages[Math.min(stageIndex, stages.length - 1)];
+  const pct          = Math.round(progressLive);
 
-  // Colour ramp: red → amber → green
   const barColor =
     pct < 33 ? "bg-blue-500" :
     pct < 66 ? "bg-teal-500" :
@@ -169,7 +258,7 @@ export function UploadView({ onSubmit, onCancel }: Props) {
         <div>
           <h2 className="text-xl font-bold text-foreground">Upload &amp; Rank</h2>
           <p className="text-sm text-muted-foreground">
-            Upload a JD PDF and candidates CSV to generate AI-powered rankings
+            Upload one or more JD PDFs and a candidates CSV to generate AI-powered rankings
           </p>
         </div>
         {onCancel && (
@@ -184,25 +273,71 @@ export function UploadView({ onSubmit, onCancel }: Props) {
       </div>
 
       <div className="rounded-xl border bg-card shadow-card p-5 space-y-5">
-        {/* JD file */}
+
+        {/* ── JD files (multi) ────────────────────────────────────────── */}
         <div className="space-y-1.5">
           <label className="text-sm font-semibold text-foreground flex items-center gap-2">
             <FileText className="w-4 h-4 text-muted-foreground" />
-            Job Description (PDF)
+            Job Description(s) (PDF)
+            {jdFiles.length > 0 && (
+              <span className="ml-auto text-xs font-normal bg-teal-100 text-teal-700 px-2 py-0.5 rounded-full">
+                {jdFiles.length} file{jdFiles.length > 1 ? "s" : ""} added
+              </span>
+            )}
           </label>
-          <input
-            type="file" accept="application/pdf" disabled={isPending}
-            onChange={(e) => setJdFile(e.target.files?.[0] ?? null)}
-            className="w-full text-sm file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-muted file:text-foreground hover:file:bg-muted/80 disabled:opacity-50"
-          />
-          {jdFile && (
-            <p className="text-xs text-muted-foreground flex items-center gap-1">
-              <CheckCircle2 className="w-3 h-3 text-green-500" /> {jdFile.name}
+
+          {/* Drop zone / picker */}
+          <label
+            className={`flex items-center gap-2 w-full px-3 py-2 rounded-lg border border-dashed cursor-pointer transition-colors text-sm
+              ${isPending ? "opacity-50 pointer-events-none" : "hover:bg-muted/40 hover:border-teal-400"}`}
+          >
+            <Plus className="w-4 h-4 text-muted-foreground shrink-0" />
+            <span className="text-muted-foreground">
+              {jdFiles.length === 0 ? "Select one or more JD PDFs" : "Add more JD PDFs"}
+            </span>
+            <input
+              type="file"
+              accept="application/pdf"
+              multiple
+              disabled={isPending}
+              className="hidden"
+              onChange={(e) => addJdFiles(e.target.files)}
+            />
+          </label>
+
+          {/* File list */}
+          {jdFiles.length > 0 && (
+            <ul className="space-y-1">
+              {jdFiles.map((f, i) => (
+                <li
+                  key={f.name + i}
+                  className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-1.5"
+                >
+                  <CheckCircle2 className="w-3 h-3 text-green-500 shrink-0" />
+                  <span className="flex-1 truncate">{f.name}</span>
+                  {!isPending && (
+                    <button
+                      onClick={() => removeJd(i)}
+                      className="text-muted-foreground hover:text-red-500 transition-colors"
+                      aria-label="Remove"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {jdFiles.length > 1 && (
+            <p className="text-xs text-teal-600 flex items-center gap-1">
+              <CheckCircle2 className="w-3 h-3" />
+              Candidates will be ranked &amp; sorted by their best match across all {jdFiles.length} JDs
             </p>
           )}
         </div>
 
-        {/* CSV file */}
+        {/* ── CSV file ────────────────────────────────────────────────── */}
         <div className="space-y-1.5">
           <label className="text-sm font-semibold text-foreground flex items-center gap-2">
             <FileSpreadsheet className="w-4 h-4 text-muted-foreground" />
@@ -214,13 +349,27 @@ export function UploadView({ onSubmit, onCancel }: Props) {
             className="w-full text-sm file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-muted file:text-foreground hover:file:bg-muted/80 disabled:opacity-50"
           />
           {cvFile && (
-            <p className="text-xs text-muted-foreground flex items-center gap-1">
-              <CheckCircle2 className="w-3 h-3 text-green-500" /> {cvFile.name}
-            </p>
+            <div className="space-y-1">
+              <p className="text-xs text-muted-foreground flex items-center gap-1">
+                <CheckCircle2 className="w-3 h-3 text-green-500" /> {cvFile.name}
+              </p>
+              {aoiDetected === true && (
+                <p className="text-xs text-teal-600 flex items-center gap-1">
+                  <CheckCircle2 className="w-3 h-3" />
+                  "Area of Interest" column detected — will be shown in results
+                </p>
+              )}
+              {aoiDetected === false && (
+                <p className="text-xs text-muted-foreground flex items-center gap-1">
+                  <AlertCircle className="w-3 h-3" />
+                  No "Area of Interest" column found — add one to show it in results
+                </p>
+              )}
+            </div>
           )}
         </div>
 
-        {/* Portfolio toggle */}
+        {/* ── Portfolio toggle ─────────────────────────────────────────── */}
         <label className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer select-none transition-colors ${
           extractPortfolios ? "bg-teal-50 border-teal-200" : "bg-muted/30 border-border"
         } ${isPending ? "opacity-50 pointer-events-none" : ""}`}>
@@ -240,22 +389,23 @@ export function UploadView({ onSubmit, onCancel }: Props) {
           </div>
         </label>
 
-        {/* Submit */}
+        {/* ── Submit ───────────────────────────────────────────────────── */}
         <button
           onClick={() => mutation.mutate()}
-          disabled={isPending || !jdFile || !cvFile}
+          disabled={isPending || jdFiles.length === 0 || !cvFile}
           className="w-full px-4 py-2.5 text-sm font-semibold rounded-lg teal-gradient text-white shadow-teal hover:opacity-90 disabled:opacity-60 transition-opacity flex items-center justify-center gap-2"
         >
           {isPending
             ? <><Loader2 className="w-4 h-4 animate-spin" /> Processing...</>
-            : "Process & Rank Candidates"
+            : jdFiles.length > 1
+              ? `Process & Rank Candidates Across ${jdFiles.length} JDs`
+              : "Process & Rank Candidates"
           }
         </button>
 
-        {/* ── Progress UI ────────────────────────────────────────────────── */}
+        {/* ── Progress UI ───────────────────────────────────────────────── */}
         {isPending && (
           <div className="space-y-3">
-            {/* Bar */}
             <div className="space-y-1.5">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-medium text-foreground">{currentStage?.label}</span>
@@ -270,19 +420,17 @@ export function UploadView({ onSubmit, onCancel }: Props) {
               <p className="text-[11px] text-muted-foreground">{currentStage?.sublabel}</p>
             </div>
 
-            {/* Stage checklist */}
             <div className="rounded-lg bg-muted/40 border divide-y divide-border overflow-hidden">
               {stages.map((s, i) => {
-                const done    = i < stageIndex || isDone;
-                const active  = i === stageIndex && !isDone;
-                const pending = i > stageIndex;
+                const done   = i < stageIndex || isDone;
+                const active = i === stageIndex && !isDone;
                 return (
                   <div
                     key={s.key}
                     className={`flex items-center gap-3 px-3 py-2.5 text-xs transition-colors ${
-                      done    ? "text-green-700 bg-green-50/60" :
-                      active  ? "text-foreground bg-background font-medium" :
-                                "text-muted-foreground"
+                      done   ? "text-green-700 bg-green-50/60" :
+                      active ? "text-foreground bg-background font-medium" :
+                               "text-muted-foreground"
                     }`}
                   >
                     {done ? (
@@ -303,7 +451,6 @@ export function UploadView({ onSubmit, onCancel }: Props) {
               })}
             </div>
 
-            {/* Time estimate */}
             {extractPortfolios && stageIndex >= (stages.length - 1) && (
               <p className="text-[11px] text-muted-foreground text-center">
                 Portfolio scraping takes ~2 sec per URL — grab a coffee ☕
@@ -312,7 +459,7 @@ export function UploadView({ onSubmit, onCancel }: Props) {
           </div>
         )}
 
-        {/* Error */}
+        {/* ── Error ────────────────────────────────────────────────────── */}
         {mutation.error && (
           <div className="flex items-start gap-2 rounded-lg bg-red-50 border border-red-200 p-3 text-xs text-red-700">
             <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
@@ -324,4 +471,20 @@ export function UploadView({ onSubmit, onCancel }: Props) {
       </div>
     </div>
   );
+}
+
+async function rankCVsMulti({
+  jdFiles,
+  cvFile,
+  extractPortfolios,
+}: {
+  jdFiles: File[];
+  cvFile: File;
+  extractPortfolios: boolean;
+}): Promise<ApiRankingResponse> {
+  return rankCVs(jdFiles[0], cvFile, extractPortfolios, {
+    jdFile: jdFiles[0],
+    cvFile,
+    extractPortfolios,
+  });
 }

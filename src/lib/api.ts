@@ -23,7 +23,7 @@ export async function extractJD(jdPdfFile: File) {
   return mustJson<ApiJDExtractResponse>(res);
 }
 
-export async function rankCVs(args: {
+export async function rankCVs(p0: File, cvFile: File, extractPortfolios: boolean, args: {
   jdFile: File;
   cvFile: File;
   extractPortfolios: boolean;
@@ -35,4 +35,18 @@ export async function rankCVs(args: {
 
   const res = await fetch(`${API_BASE}/rank-cvs`, { method: "POST", body: fd });
   return mustJson<ApiRankingResponse>(res);
+}
+export async function rankCVsMulti(params: {
+  jdFiles: File[];
+  cvFile: File;
+  extractPortfolios: boolean;
+}) {
+  const form = new FormData();
+  params.jdFiles.forEach((f) => form.append("jd_files", f));  // name must match backend
+  form.append("cv_file", params.cvFile);
+  form.append("extract_portfolios", String(params.extractPortfolios));
+
+  const res = await fetch(`${API_BASE}/rank-cvs-multi`, { method: "POST", body: form });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
 }
